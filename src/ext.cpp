@@ -67,8 +67,13 @@ void soft_mask_from_model(gemmi::Grid<T> &grid, gemmi::Model &model,
 
 NB_MODULE(ext, m) {
   m.doc() = "Servalcat extension";
-  // importing gemmi allows to output gemmi types from nanobind.stubgen.
+
+  // By default do NOT import gemmi here to avoid duplicate registration of nanobind types
+  // when the gemmi Python extension is also present. Enable IMPORT_GEMMI_FOR_STUBGEN at
+  // build time only if importing gemmi inside ext for stub generation is needed.
+#ifdef IMPORT_GEMMI_FOR_STUBGEN
   nb::module_::import_("gemmi");
+#endif
 
   add_refine(m);
   add_intensity(m);
