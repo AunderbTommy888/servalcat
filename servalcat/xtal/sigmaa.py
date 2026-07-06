@@ -1692,7 +1692,6 @@ def calc_Fmask(st, d_min, miller_array, use_non_binary_mask=False):
     if use_non_binary_mask:
         logger.writeln("Using non-binary solvent mask")
         masker.use_atom_occupancy = True
-        masker.island_min_volume = 0
     masker.put_mask_on_float_grid(grid, st[0])
     #utils.maps.write_ccp4_map("solmask.ccp4", grid)
     fmask_gr = gemmi.transform_map_to_f_phi(grid)
