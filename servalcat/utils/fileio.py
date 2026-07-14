@@ -268,9 +268,12 @@ def read_mmhkl(hklin, cif_index=0): # mtz or mmcif
         raise RuntimeError("Unsupported file type: {}".format(spext[1]))
     if mtz.spacegroup is None:
         raise RuntimeError("Missing space group information")
-    logger.writeln("    Unit cell: {:.4f} {:.4f} {:.4f} {:.3f} {:.3f} {:.3f}".format(*mtz.cell.parameters))
-    logger.writeln("  Space group: {}".format(mtz.spacegroup.xhm()))
-    logger.writeln("      Columns: {}".format(" ".join(mtz.column_labels())))
+    logger.writeln(" Space group: {}".format(mtz.spacegroup.xhm()))
+    for ds in mtz.datasets:
+        logger.writeln(f" Dataset {ds.id} {ds.project_name}/{ds.crystal_name}/{ds.dataset_name}")
+        logger.writeln( "   Unit cell: {:.4f} {:.4f} {:.4f} {:.3f} {:.3f} {:.3f}".format(*ds.cell.parameters))
+        logger.writeln(f"  Wavelength: {ds.wavelength}")
+        logger.writeln(f"     Columns: {' '.join(col.label for col in mtz.columns if col.dataset_id == ds.id)}")
     logger.writeln("")
     return mtz
 # read_mmhkl()
@@ -556,7 +559,7 @@ def read_shelx_ins(ins_in=None, lines_in=None, ignore_q_peaks=True): # TODO supp
         elif l.startswith(" "): # title continued? instructions after space is allowed??
             pass
         elif ins == "CELL":
-            #ss.wavelength = float(sp[1]) # next gemmi ver.
+            ss.wavelength = float(sp[1])
             ss.cell.set(*map(float, sp[2:]))
             cif2cart = model.cif2cart_matrix(ss.cell)
         elif ins == "LATT":
@@ -789,7 +792,7 @@ def read_smcif_shelx(cif_in):
 # read_smcif_shelx()
 
 def read_small_molecule_files(files):
-    st, mtz, hklf = None, None, None
+    st, mtz, hklf, wavelength = None, None, None, None
     # first pass - find structure
     for filename in files:
         ext = splitext(filename)[1]
@@ -807,8 +810,10 @@ def read_small_molecule_files(files):
                     with open(filename) as f:
                         res_str = f.read()
                 if res_str:
-                    _, info = read_shelx_ins(lines_in=res_str.splitlines())
+                    ss, info = read_shelx_ins(lines_in=res_str.splitlines())
                     hklf = info["hklf"]
+                    if ss.wavelength > 0:
+                        wavelength = ss.wavelength
     if st is None:
         logger.writeln("ERROR: coordinates not found.")
         return None, None
@@ -824,6 +829,9 @@ def read_small_molecule_files(files):
                 logger.writeln("reflection data read from: {}".format(filename))
             elif b.find_loop("_refln_index_h") or b.find_loop("_diffrn_refln_index_h"):
                 mtz = read_smcif_hkl(filename, st.cell, st.find_spacegroup())
+            if tmp := b.find_value("_diffrn_radiation_wavelength"): # XXX could be multiple
+                if (tmp2 := gemmi.cif.as_number(tmp, 0)) > 0:
+                    wavelength = tmp2
         except ValueError as e: # not a cif file
             if ext == ".hkl":
                 mtz = read_shelx_hkl(st.cell, st.find_spacegroup(), hklf, file_in=filename)
@@ -831,6 +839,8 @@ def read_small_molecule_files(files):
             else:
                 logger.writeln(f" {e}")                
 
+    if wavelength and mtz:
+        mtz.datasets[1].wavelength = wavelength
     return st, mtz
 
 def read_sequence_file(f):

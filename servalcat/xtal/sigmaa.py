@@ -1865,8 +1865,20 @@ def main(args):
             labin_free=args.labin_free)
     except RuntimeError as e:
         raise SystemExit("Error: {}".format(e))
+    
+    if args.source != "xray":
+        if hkldata.wavelength:
+            logger.writeln(f"Ignoring wavelength in the input file")
+        hkldata.wavelength = None
+    elif args.wavelength == 0:
+        logger.writeln(f"Ignoring wavelength as --wavelength=0 was given")
+        hkldata.wavelength = None
+    elif args.wavelength:
+        if hkldata.wavelength and abs(hkldata.wavelength - args.wavelength) > 0.0001:
+            logger.writeln(f"Updating wavelength using --wavelength={args.wavelength}")
+        hkldata.wavelength = args.wavelength
 
-    addends, addends2 = utils.model.check_atomsf(sts, args.source, mott_bethe=(args.source=="electron"), wavelength=args.wavelength)
+    addends, addends2 = utils.model.check_atomsf(sts, args.source, mott_bethe=(args.source=="electron"), wavelength=hkldata.wavelength)
     for st in sts:
         utils.model.find_special_positions(st, fix_occ=True, fix_pos=False, fix_adp=False)
 

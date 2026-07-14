@@ -116,7 +116,8 @@ def hkldata_from_mtz(mtz, labels, newlabels=None, require_types=None):
         
         df.rename(columns={x:y for x,y in zip(labels, newlabels) if y != ""}, inplace=True)
 
-    return HklData(mtz.cell, mtz.spacegroup, df)
+    ds_obs = mtz.column_with_label(labels[0]).dataset # assuming the first is the observation
+    return HklData(ds_obs.cell, mtz.spacegroup, df, wavelength=ds_obs.wavelength)
 # hkldata_from_mtz()
 
 def df_from_twin_data(twin_data, fc_labs):
@@ -242,13 +243,16 @@ def fft_map(cell, sg, miller_array, data, grid_size=None, sample_rate=3):
 # fft_map()
 
 class HklData:
-    def __init__(self, cell, sg, df=None, binned_df=None):
+    def __init__(self, cell, sg, df=None, binned_df=None, wavelength=None):
         self.cell = cell
         self.sg = sg
         self.df = df
         self.binned_df = {} if binned_df is None else binned_df
         self._bin_and_indices = {}
         self.centric_and_selections = {}
+        self.wavelength = wavelength # should be label-dependent?
+        if self.wavelength == 0:
+            self.wavelength = None
     # __init__()
 
     def update_cell(self, cell):
@@ -278,12 +282,12 @@ class HklData:
             df = self.df[sel].copy()
             binned_df = None # no way to keep it
         
-        return HklData(self.cell, self.sg,  df, binned_df)
+        return HklData(self.cell, self.sg,  df, binned_df, self.wavelength)
     # copy()
 
     def selected(self, sel):
         df = self.df[sel].copy()
-        return HklData(self.cell, self.sg,  df)
+        return HklData(self.cell, self.sg,  df, wavelength=self.wavelength)
 
     def merge_asu_data(self, asu_data, label, common_only=True):
         if self.df is not None and label in self.df:
@@ -776,11 +780,12 @@ class HklData:
                 data[:,idx] = df[lab].to_numpy(numpy.float32, na_value=numpy.nan) # for nullable integers
                 idx += 1
 
-        mtz = gemmi.Mtz()
+        mtz = gemmi.Mtz(with_base=True)
         mtz.spacegroup = self.sg
         mtz.cell = self.cell
-        mtz.add_dataset('HKL_base')
-        for label in ['H', 'K', 'L']: mtz.add_column(label, 'H')
+        ds = mtz.add_dataset('unknown')
+        if self.wavelength:
+            ds.wavelength = self.wavelength 
 
         for lab in labs:
             if numpy.iscomplexobj(df[lab]):

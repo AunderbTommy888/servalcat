@@ -182,6 +182,18 @@ def main(args):
     except RuntimeError as e:
         raise SystemExit("Error: {}".format(e))
 
+    if args.source != "xray":
+        if hkldata.wavelength:
+            logger.writeln(f"Ignoring wavelength in the input file")
+        hkldata.wavelength = None
+    elif args.wavelength == 0:
+        logger.writeln(f"Ignoring wavelength as --wavelength=0 was given")
+        hkldata.wavelength = None
+    elif args.wavelength:
+        if hkldata.wavelength and abs(hkldata.wavelength - args.wavelength) > 0.0001:
+            logger.writeln(f"Updating wavelength using --wavelength={args.wavelength}")
+        hkldata.wavelength = args.wavelength
+    
     if "FREE" in hkldata.df:
         use_in_target = "work"
     else:
@@ -194,7 +206,7 @@ def main(args):
         ccu.show_info()
         addends, addends2 = None, None
     else:
-        addends, addends2 = utils.model.check_atomsf(sts, args.source, mott_bethe=(args.source=="electron"), wavelength=args.wavelength)
+        addends, addends2 = utils.model.check_atomsf(sts, args.source, mott_bethe=(args.source=="electron"), wavelength=hkldata.wavelength)
     if args.use_fw:
         if not is_int:
             raise SystemExit("Error: need intensity input when -use_fw")
