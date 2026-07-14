@@ -161,8 +161,7 @@ def prepare_crd(st, crdout, ligand, make, monlib_path=None, h_pos="elec",
     st.ncs = gemmi.NcsOpList(x for x in st.ncs if not x.given)
 
     # for safety
-    if "_entry.id" in st.info:
-        st.info["_entry.id"] = st.info["_entry.id"].replace(" ", "")
+    refmac_fixes.keep_entry_id(st)
     date_key = "_pdbx_database_status.recvd_initial_deposition_date"
     if date_key in st.info:
         tmp = st.info[date_key]
@@ -256,10 +255,13 @@ def modify_output(pdbout, cifout, fixes, hout, cispeps, software_items, modres, 
     
     suffix = ".org"
     os.rename(cifout, cifout + suffix)
-    utils.fileio.write_mmcif(st, cifout, cifout + suffix)
+    doc_ref = gemmi.cif.read(cifout + suffix)
+    # dirty hack: knowing this is the only entry_id that Refmac writes and cannot be updated in write_mmcif()
+    if doc_ref[0].find_value("_refine.entry_id") and fixes.entry_id:
+        doc_ref[0].set_pair("_refine.entry_id", gemmi.cif.quote(fixes.entry_id))
+    utils.fileio.write_mmcif(st, cifout, cif_ref_doc=doc_ref)
 
     if tls_addu:
-        doc_ref = gemmi.cif.read(cifout + suffix)
         tls_groups = {int(x.id): x for x in st.meta.refinement[0].tls_groups}
         tls_details = doc_ref[0].find_value("_ccp4_refine_tls.details")
         if tls_groups and gemmi.cif.as_string(tls_details) == "U values: residual only":

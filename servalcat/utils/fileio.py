@@ -77,6 +77,9 @@ def write_mmcif(st, cif_out, cif_ref=None, cif_ref_doc=None):
         if cif_ref:
             logger.writeln("  using mmCIF metadata from: {}".format(cif_ref))
         groups = gemmi.MmcifOutputGroups(False)
+        groups.block_name = True
+        groups.entry = True
+        groups.symmetry = True
         groups.group_pdb = True
         groups.ncs = True
         groups.atoms = True
@@ -90,7 +93,8 @@ def write_mmcif(st, cif_out, cif_ref=None, cif_ref_doc=None):
         groups.conn = True
         groups.software = True
         groups.auth_all = True
-        # FIXME is this all?
+        # The following categories will be kept as is
+        # database_status, author, struct_ref, chem_comp, exptl, diffrn, reflns, refine, title_keywords, struct_asym, origx, struct_conf, struct_sheet, struct_biol, struct_site, atom_type, tls
         if cif_ref:
             try:
                 cif_ref_doc = read_cif_safe(cif_ref)

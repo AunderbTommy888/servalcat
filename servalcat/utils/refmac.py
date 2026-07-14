@@ -150,6 +150,8 @@ class FixForRefmac:
         self.resn_old_new = []
         self.res_labels = []
         self.entities = None
+        self.entry_id = None
+        self.st_name = None
         
     def fix_before_topology(self, st, topo, fix_microheterogeneity=True, fix_resimax=True, fix_nonpolymer=True, add_gaps=False):
         self.chainids = set(chain.name for chain in st[0])
@@ -394,7 +396,13 @@ class FixForRefmac:
             self.res_labels.append([])
             for res in chain:
                 self.res_labels[-1].append((res.subchain, res.entity_id, res.label_seq))
-        
+
+    def keep_entry_id(self, st):
+        self.st_name = st.name
+        if "_entry.id" in st.info:
+            self.entry_id = st.info["_entry.id"]
+            st.info["_entry.id"] = "0000" # dummy
+    
     def fix_model(self, st, changedict):
         chain_newid = set()
         for chain in st[0]:
@@ -413,6 +421,10 @@ class FixForRefmac:
         self.fix_metadata(st, changedict)
         
     def modify_back(self, st):
+        if self.st_name:
+            st.name = self.st_name
+        if self.entry_id:
+            st.info["_entry.id"] = self.entry_id
         for fix in reversed(self.fixes):
             reschanges = dict([x[::-1] for x in fix])
             self.fix_model(st, reschanges)
