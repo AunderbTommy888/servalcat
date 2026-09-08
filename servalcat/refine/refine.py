@@ -789,7 +789,10 @@ class Refine:
         if self.ff_prior is not None:
             logger.writeln(" AMBER force-field prior")
             logger.writeln("  weight: {}".format(self.ff_weight))
-            logger.writeln("  hessian_diag: {}".format(self.ff_prior.hessian_diag))
+            logger.writeln("  hessian_mode: {}".format(self.ff_prior.hessian_mode))
+            logger.writeln("  hessian_diag ({}): {}".format("floor" if self.ff_prior.hessian_mode == "bonded" else "const",
+                                                            self.ff_prior.hessian_diag))
+            logger.writeln("  his_state: {}".format(self.ff_prior.his_state))
 
     def scale_shifts(self, dx, scale):
         shift_allow_high =  1.0
@@ -948,7 +951,8 @@ class Refine:
                 vn += numpy.array(self.ll.ll.vn) * weight
             if self.ff_prior is not None and self.ff_grad is not None:
                 vn += self.ff_grad * self.ff_weight
-                am = am + scipy.sparse.identity(am.shape[0], format="csr") * (self.ff_prior.hessian_diag * self.ff_weight)
+                # diagonal (Gauss-Newton) approximation of the force-field Hessian, per parameter
+                am = am + scipy.sparse.diags(self.ff_prior.hessian_diag_vector() * self.ff_weight, format="csr")
             diag = am.diagonal()
             diag[diag<=0] = 1.
             diag = numpy.sqrt(diag)

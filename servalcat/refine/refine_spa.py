@@ -142,8 +142,15 @@ def add_arguments(parser):
                         help="OpenMM nonbonded method (default: %(default)s)")
     parser.add_argument("--amber_platform", default="Reference",
                         help="OpenMM platform name (default: %(default)s)")
-    parser.add_argument("--amber_hessian_diag", type=float, default=10.0,
-                        help="Diagonal Hessian approximation for AMBER prior (default: %(default)f)")
+    parser.add_argument("--amber_hessian_diag", type=float, default=1000.0,
+                        help="Diagonal Hessian for AMBER prior in kJ/mol/A^2: the value itself in const mode, "
+                             "or the floor of the per-atom bonded estimate in bonded mode (default: %(default)f)")
+    parser.add_argument("--amber_hessian_mode", choices=["bonded", "const"], default="bonded",
+                        help="How to approximate the AMBER Hessian diagonal: per-atom Gauss-Newton estimate from "
+                             "bond/angle terms (bonded) or a constant (const) (default: %(default)s)")
+    parser.add_argument("--amber_his_state", choices=["HIP", "HIE", "HID"], default="HIP",
+                        help="Histidine protonation state in the force field. HIP keeps HD1 and HE2 as generated "
+                             "from the monomer library; HIE/HID exclude HD1/HE2 from the force field (default: %(default)s)")
     parser.add_argument("--config",
                         help="Config file (.yaml)")
     parser.add_argument("--halfmapcc_for_dynamic_weighting", help=argparse.SUPPRESS) # testing
@@ -238,7 +245,7 @@ def main(args):
         for i, cra in enumerate(st[0].all()):
             cra.atom.serial = i + 1
 
-    if h_change == gemmi.HydrogenChange.ReAddKnown and use_nucleus:
+    if h_change in (gemmi.HydrogenChange.ReAdd, gemmi.HydrogenChange.ReAddKnown) and use_nucleus:
         topo.adjust_hydrogen_distances(gemmi.Restraints.DistanceOf.Nucleus,
                                        default_scale=utils.restraints.default_proton_scale)
 
@@ -310,7 +317,9 @@ def main(args):
                                 forcefield_files=args.amber_forcefield,
                                 nonbonded_method=args.amber_nonbonded,
                                 platform_name=args.amber_platform,
-                                hessian_diag=args.amber_hessian_diag)
+                                hessian_diag=args.amber_hessian_diag,
+                                hessian_mode=args.amber_hessian_mode,
+                                his_state=args.amber_his_state)
     refiner = Refine(st, geom, refine_cfg, refine_params, ll,
                      unrestrained=args.unrestrained,
                      ff_prior=ff_prior,

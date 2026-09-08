@@ -13,6 +13,9 @@
 3. `amber_refine_phase1_design_ja.md`
    - 実験項 + AMBER 力場項を併用する Phase 1 実装の設計図と進捗。
 
+4. `amber_hessian_protonation_note_ja.md`
+   - AMBER エネルギー増加の原因調査と修正の解説 (対角 Hessian の導出、水素の核位置調整、プロトン化状態)。
+
 ## この階層での運用方針
 
 - 開発向けの手順・注意事項は `docs/dev/` 配下へ集約する。
