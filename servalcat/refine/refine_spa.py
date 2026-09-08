@@ -137,9 +137,10 @@ def add_arguments(parser):
     parser.add_argument("--amber_forcefield", nargs="+",
                         default=["amber14-all.xml", "amber14/tip3p.xml"],
                         help="OpenMM forcefield XML files (default: %(default)s)")
-    parser.add_argument("--amber_nonbonded", choices=["NoCutoff", "CutoffNonPeriodic", "PME"],
+    parser.add_argument("--amber_nonbonded", choices=["NoCutoff", "CutoffNonPeriodic"],
                         default="NoCutoff",
-                        help="OpenMM nonbonded method (default: %(default)s)")
+                        help="OpenMM nonbonded method. Periodic methods (PME etc.) are not supported: the SPA map box "
+                             "would be taken as a periodic cell (default: %(default)s)")
     parser.add_argument("--amber_platform", default="Reference",
                         help="OpenMM platform name (default: %(default)s)")
     parser.add_argument("--amber_hessian_diag", type=float, default=1000.0,
@@ -162,12 +163,26 @@ def parse_args(arg_list):
     return parser.parse_args(arg_list)
 # parse_args()
 
+def check_amber_args(args):
+    """Fail early with a clear message when --amber_enable is combined with unsupported options."""
+    if not getattr(args, "amber_enable", False):
+        return
+    if args.hydrogen != "all":
+        raise SystemExit("Error: --amber_enable requires --hydrogen all (OpenMM residue templates need a complete "
+                         "set of hydrogen atoms; got --hydrogen {})".format(args.hydrogen))
+    if getattr(args, "unrestrained", False):
+        raise SystemExit("Error: --amber_enable cannot be used with --unrestrained (hydrogen atoms are not generated)")
+    if getattr(args, "jellyonly", False):
+        raise SystemExit("Error: --amber_enable cannot be used with --jellyonly")
+# check_amber_args()
+
 def main(args):
     args.mask = None
     args.invert_mask = False
     args.trim_fofc_mtz = args.mask_for_fofc is not None
     args.cross_validation_method = "throughout"
     check_args(args)
+    check_amber_args(args)
     params = refmac_keywords.parse_keywords(args.keywords + [l for f in args.keyword_file for l in open(f)])
     refine_cfg = load_config(args.config, args, params)
 

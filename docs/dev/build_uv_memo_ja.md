@@ -267,6 +267,8 @@ CLIBD_MON="$PWD/third_party/monomers" \
 - AMBER prior は alternate conformation (altloc) を持つ原子のうち最初の conformer だけを OpenMM に渡す。
   除外された原子数はログに `AMBER prior: N atom(s) in alternative conformations are excluded ...` と出る。
 - His のプロトン化状態は `--amber_his_state HIE` などで指定できる (既定 HIP = monomer library どおり)。
+- `--amber_enable` は `--hydrogen all` (既定) が必須。`--hydrogen no/yes`、`--unrestrained`、`--jellyonly` との併用は起動時にエラーになる。
+- `--amber_nonbonded` は `NoCutoff` か `CutoffNonPeriodic` のみ (PME は SPA のマップ箱を周期セルとみなしてしまうため除外)。
 - 対角 Hessian は既定で結合項から原子ごとに推定する (`--amber_hessian_mode bonded`)。旧挙動は
   `--amber_hessian_mode const --amber_hessian_diag 10`。背景は `amber_hessian_protonation_note_ja.md`。
 - 複数サイクルの安定性確認は `--ncycle 5 --hout` を付け、出力モデルの水 O–H 距離を見るのが手早い。

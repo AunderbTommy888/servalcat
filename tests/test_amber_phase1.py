@@ -60,6 +60,17 @@ class TestAmberPhase1(unittest.TestCase):
         self.assertEqual(args.amber_hessian_mode, "const")
         self.assertEqual(args.amber_his_state, "HIE")
 
+    def test_check_amber_args(self):
+        base = ["--halfmaps", "half1.mrc", "half2.mrc", "--model", "model.pdb", "-d", "3.0", "--amber_enable"]
+        refine_spa.check_amber_args(refine_spa.parse_args(base))  # --hydrogen all is the default
+        for extra in (["--hydrogen", "no"], ["--hydrogen", "yes"], ["--unrestrained"], ["--jellyonly"]):
+            with self.assertRaises(SystemExit):
+                refine_spa.check_amber_args(refine_spa.parse_args(base + extra))
+        # without --amber_enable nothing is checked
+        refine_spa.check_amber_args(refine_spa.parse_args(base[:-1] + ["--hydrogen", "no"]))
+        with self.assertRaises(SystemExit):  # PME is no longer a valid choice
+            refine_spa.parse_args(base + ["--amber_nonbonded", "PME"])
+
     def test_xyz_grad_to_param_grad(self):
         grad_xyz = numpy.array([
             [1.0, 2.0, 3.0],
@@ -179,6 +190,8 @@ class TestAmberPhase1(unittest.TestCase):
             self.assertTrue(numpy.all(numpy.isfinite(grad)))
         with self.assertRaises(RuntimeError):
             AmberFFPrior(st, rp, platform_name="Reference", his_state="HIX")
+        with self.assertRaises(RuntimeError):
+            AmberFFPrior(st, rp, platform_name="Reference", nonbonded_method="PME")
 
     def test_amber_prior_unsupported_residue_error(self):
         try:

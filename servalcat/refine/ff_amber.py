@@ -154,6 +154,9 @@ class AmberFFPrior:
             raise RuntimeError("Unknown hessian mode: {} (choose from {})".format(hessian_mode, HESSIAN_MODES))
         self.hessian_mode = hessian_mode
         self.his_state = his_state
+        if nonbonded_method not in ("NoCutoff", "CutoffNonPeriodic"):
+            raise RuntimeError("Unsupported nonbonded method for AMBER prior: {} (periodic methods are not supported; "
+                               "use NoCutoff or CutoffNonPeriodic)".format(nonbonded_method))
         self._openmm = None
         self._unit = None
         self._context = None
@@ -237,6 +240,8 @@ class AmberFFPrior:
             pdb_path = os.path.join(dtmp, "amber_input.pdb")
             st_ff.write_pdb(pdb_path)
             pdb = app.PDBFile(pdb_path)
+            # The unit cell of an SPA model is the map box; never let it act as a periodic cell.
+            pdb.topology.setPeriodicBoxVectors(None)
 
             ff = app.ForceField(*self.forcefield_files)
             if not hasattr(app, self.nonbonded_method):
