@@ -10,6 +10,9 @@
 2. `build_uv_memo_ja.md`
    - `uv` による開発用ビルド、editable install、依存データ、テスト実行コマンド。
 
+3. `amber_refine_phase1_design_ja.md`
+   - 実験項 + AMBER 力場項を併用する Phase 1 実装の設計図と進捗。
+
 ## この階層での運用方針
 
 - 開発向けの手順・注意事項は `docs/dev/` 配下へ集約する。

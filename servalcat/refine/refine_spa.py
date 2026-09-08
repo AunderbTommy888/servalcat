@@ -15,6 +15,7 @@ from servalcat.spa.run_refmac import check_args, process_input, calc_fsc, calc_f
 from servalcat.spa import fofc
 from servalcat.refine import spa
 from servalcat.refine.refine import Geom, Refine, RefineParams, update_meta, print_h_options, load_config
+from servalcat.refine.ff_amber import AmberFFPrior
 from servalcat.refmac import refmac_keywords
 b_to_u = utils.model.b_to_u
 
@@ -129,6 +130,20 @@ def add_arguments(parser):
                         help="Do not override entities")
     parser.add_argument("--write_trajectory", action='store_true',
                         help="Write all output from cycles")
+    parser.add_argument("--amber_enable", action="store_true",
+                        help="Enable AMBER force-field prior (Phase 1: xyz only)")
+    parser.add_argument("--amber_weight", type=float, default=0.1,
+                        help="Weight for AMBER force-field prior (default: %(default)f)")
+    parser.add_argument("--amber_forcefield", nargs="+",
+                        default=["amber14-all.xml", "amber14/tip3p.xml"],
+                        help="OpenMM forcefield XML files (default: %(default)s)")
+    parser.add_argument("--amber_nonbonded", choices=["NoCutoff", "CutoffNonPeriodic", "PME"],
+                        default="NoCutoff",
+                        help="OpenMM nonbonded method (default: %(default)s)")
+    parser.add_argument("--amber_platform", default="Reference",
+                        help="OpenMM platform name (default: %(default)s)")
+    parser.add_argument("--amber_hessian_diag", type=float, default=10.0,
+                        help="Diagonal Hessian approximation for AMBER prior (default: %(default)f)")
     parser.add_argument("--config",
                         help="Config file (.yaml)")
     parser.add_argument("--halfmapcc_for_dynamic_weighting", help=argparse.SUPPRESS) # testing
@@ -203,9 +218,13 @@ def main(args):
         hkldata, info = process_input(st, maps, resolution=args.resolution - 1e-6, monlib=monlib,
                                       mask_in=args.mask, args=args, use_refmac=False,
                                       find_links=args.find_links)
-    h_change = {"all":gemmi.HydrogenChange.ReAddKnown,
-                "yes":gemmi.HydrogenChange.NoChange,
-                "no":gemmi.HydrogenChange.Remove}[args.hydrogen]
+    if args.amber_enable and args.hydrogen == "all":
+        logger.writeln("AMBER prior enabled: using full hydrogen regeneration for OpenMM template compatibility")
+        h_change = gemmi.HydrogenChange.ReAdd
+    else:
+        h_change = {"all":gemmi.HydrogenChange.ReAddKnown,
+                    "yes":gemmi.HydrogenChange.NoChange,
+                    "no":gemmi.HydrogenChange.Remove}[args.hydrogen]
     use_nucleus = args.source in ("neutron", "electron")
     try:
         topo, _ = utils.restraints.prepare_topology(st, monlib, h_change=h_change,
@@ -213,6 +232,11 @@ def main(args):
                                                     params=params)
     except RuntimeError as e:
         raise SystemExit("Error: {}".format(e))
+
+    if args.amber_enable:
+        logger.writeln("AMBER prior enabled: renumbering atom serials after hydrogen generation")
+        for i, cra in enumerate(st[0].all()):
+            cra.atom.serial = i + 1
 
     if h_change == gemmi.HydrogenChange.ReAddKnown and use_nucleus:
         topo.adjust_hydrogen_distances(gemmi.Restraints.DistanceOf.Nucleus,
@@ -280,8 +304,17 @@ def main(args):
     ll = spa.LL_SPA(hkldata, st, monlib,
                     lab_obs="F_map1" if args.cross_validation else "FP",
                     source=args.source)
+    ff_prior = None
+    if args.amber_enable:
+        ff_prior = AmberFFPrior(st, refine_params,
+                                forcefield_files=args.amber_forcefield,
+                                nonbonded_method=args.amber_nonbonded,
+                                platform_name=args.amber_platform,
+                                hessian_diag=args.amber_hessian_diag)
     refiner = Refine(st, geom, refine_cfg, refine_params, ll,
-                     unrestrained=args.unrestrained)
+                     unrestrained=args.unrestrained,
+                     ff_prior=ff_prior,
+                     ff_weight=args.amber_weight)
 
     geom.geom.adpr_max_dist = args.max_dist_for_adp_restraint
     if args.adp_restraint_power is not None: geom.geom.adpr_d_power = args.adp_restraint_power

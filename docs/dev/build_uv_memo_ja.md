@@ -39,6 +39,22 @@ uv pip install -e .
 .venv/bin/servalcat --version
 ```
 
+## OpenMM (AMBER Phase 1) 追加依存
+
+AMBER 力場を使う Phase 1 実装を動かす場合は、OpenMM を追加で入れる。
+
+```bash
+cd "$PROJECT_ROOT"
+uv pip install openmm
+```
+
+導入確認:
+
+```bash
+cd "$PROJECT_ROOT"
+.venv/bin/python -c "import openmm; print(openmm.__version__)"
+```
+
 ## よくある失敗と対処
 
 ### エラー: Eigen3 が見つからない
@@ -113,12 +129,40 @@ cd "$PROJECT_ROOT"
 .venv/bin/python tests/test_for_ci.py
 ```
 
+AMBER Phase 1 テスト (OpenMM 必須):
+
+```bash
+cd "$PROJECT_ROOT"
+CLIBD_MON="$PWD/third_party/monomers" .venv/bin/python tests/test_amber_phase1.py
+```
+
+AMBER 併用 SPA リファイン実行例 (7dy0, 1 cycle):
+
+```bash
+cd "$PROJECT_ROOT"
+CLIBD_MON="$PWD/third_party/monomers" \
+	.venv/bin/python -m servalcat refine_spa_norefmac \
+	--model tests/7dy0/pdb7dy0.ent.gz \
+	--halfmaps tests/7dy0/emd_30913_half_map_1.map.gz tests/7dy0/emd_30913_half_map_2.map.gz \
+	-d 3.1 \
+	--ncycle 1 \
+	--weight 1.0 \
+	--amber_enable \
+	--amber_platform Reference \
+	--amber_weight 0.05 \
+	-o tests/7dy0/amber_example_run/refined_amber_7dy0
+```
+
 ## `test_h_add` 用の追加依存
 
 `tests/test_spa.py` の `test_h_add` は、外部モノマーライブラリが必要です。
 
 - 必要なもの: CCP4形式 monomer library
 - 参照先環境変数: `CLIBD_MON`
+
+補足:
+
+- `tests/test_amber_phase1.py` の OpenMM 実行ケースでも `CLIBD_MON` が必要。
 
 導入例:
 

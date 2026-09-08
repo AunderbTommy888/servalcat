@@ -745,13 +745,18 @@ class GroupOccupancy:
 
 
 class Refine:
-    def __init__(self, st, geom, cfg, refine_params, ll=None, unrestrained=False):
+    def __init__(self, st, geom, cfg, refine_params, ll=None, unrestrained=False,
+                 ff_prior=None, ff_weight=0.):
         assert geom is not None
         self.st = st # clone()?
         self.st_traj = None
         self.params = refine_params
         self.geom = geom
         self.ll = ll
+        self.ff_prior = ff_prior
+        self.ff_weight = ff_weight
+        self.ff_grad = None
+        self.ff_target = 0.
         self.gamma = 0
         self.unrestrained = unrestrained
         self.prev_shift = None
@@ -781,6 +786,10 @@ class Refine:
         if self.params.is_refined(Type.Q):
             logger.writeln(" Occupancy restraints")
             logger.writeln("  weight: {}".format(self.geom.occr_w))
+        if self.ff_prior is not None:
+            logger.writeln(" AMBER force-field prior")
+            logger.writeln("  weight: {}".format(self.ff_weight))
+            logger.writeln("  hessian_diag: {}".format(self.ff_prior.hessian_diag))
 
     def scale_shifts(self, dx, scale):
         shift_allow_high =  1.0
@@ -880,7 +889,14 @@ class Refine:
         else:
             ll = 0
 
-        f =  w * ll + geom
+        ff = 0
+        self.ff_grad = None
+        if self.ff_prior is not None:
+            ff, self.ff_grad = self.ff_prior.calc_target_and_grad(target_only=target_only)
+            logger.writeln(" ff= {}".format(ff))
+        self.ff_target = ff
+
+        f =  w * ll + geom + self.ff_weight * ff
         return f
 
     #@profile
@@ -911,7 +927,8 @@ class Refine:
             logger.writeln(f"geom_mat=\n{self.geom.geom.target.am_spmat}")
             logger.writeln(f"  ll_vec=\n{self.ll.ll.vn}")
             logger.writeln(f"  ll_mat=\n{self.ll.ll.fisher_spmat}")
-        if 1:
+        use_cpp_solver = self.ff_prior is None
+        if use_cpp_solver:
             use_ic = False # incomplete cholesky. problematic at least in geometry optimisation case
             logger.writeln("using cgsolve in c++, ic={}".format(use_ic))
             cgsolver = ext.CgSolve(self.geom.geom.target, None if self.ll is None else self.ll.ll)
@@ -929,6 +946,9 @@ class Refine:
             if self.ll is not None:
                 am += self.ll.ll.fisher_spmat * weight
                 vn += numpy.array(self.ll.ll.vn) * weight
+            if self.ff_prior is not None and self.ff_grad is not None:
+                vn += self.ff_grad * self.ff_weight
+                am = am + scipy.sparse.identity(am.shape[0], format="csr") * (self.ff_prior.hessian_diag * self.ff_weight)
             diag = am.diagonal()
             diag[diag<=0] = 1.
             diag = numpy.sqrt(diag)
