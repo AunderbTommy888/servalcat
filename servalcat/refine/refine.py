@@ -746,7 +746,9 @@ class GroupOccupancy:
 
 class Refine:
     def __init__(self, st, geom, cfg, refine_params, ll=None, unrestrained=False,
-                 ff_prior=None, ff_weight=0., ff_weight_auto=None):
+                 ff_prior=None, ff_weight=0., ff_weight_auto=None,
+                 ff_offdiag=False, minimizer="gn", lbfgs_maxiter=20, ls_trials=None,
+                 lm_damping=0.):
         assert geom is not None
         self.st = st # clone()?
         self.st_traj = None
@@ -757,6 +759,20 @@ class Refine:
         self.ff_weight = ff_weight
         self.ff_weight_auto = ff_weight_auto  # target ratio |w_ff g_ff| / |g_geom| over xyz params; None = fixed weight
         self.ff_weight_determined = ff_weight_auto is None
+        self.ff_offdiag = ff_offdiag       # add the off-diagonal blocks of the force-field Hessian
+        self.minimizer = minimizer         # "gn" (one Gauss-Newton step per cycle) or "lbfgs"
+        self.lbfgs_maxiter = lbfgs_maxiter
+        # halvings of the Gauss-Newton step. The diagonal-only force-field Hessian damps the step
+        # heavily, so 3 is enough there; with the off-diagonal blocks the step is much longer and
+        # needs a wider search.
+        self.ls_trials = ls_trials if ls_trials is not None else (8 if ff_offdiag else 3)
+        # explicit Levenberg-Marquardt ridge on the normal matrix, in the units of its diagonal.
+        # geometry + data are positive semi-definite and the force-field term is too, so a positive
+        # ridge is what guarantees a strictly positive definite (hence solvable) system.
+        self.lm_damping = float(lm_damping)
+        if self.lm_damping < 0:
+            raise RuntimeError("lm_damping must not be negative (got {})".format(lm_damping))
+        self.quiet = False                 # suppress per-evaluation logging (L-BFGS inner iterations)
         self.ff_grad = None
         self.ff_target = 0.
         self.gamma = 0
@@ -798,6 +814,17 @@ class Refine:
             logger.writeln("  hessian_diag ({}): {}".format("floor" if self.ff_prior.hessian_mode == "bonded" else "const",
                                                             self.ff_prior.hessian_diag))
             logger.writeln("  his_state: {}".format(self.ff_prior.his_state))
+            logger.writeln("  hessian off-diagonal: {}".format(self.ff_offdiag))
+            if self.lm_damping:
+                logger.writeln("  Levenberg-Marquardt ridge: {}".format(self.lm_damping))
+
+    def print_minimizer(self):
+        if self.minimizer == "lbfgs":
+            logger.writeln("Minimizer: L-BFGS-B in diagonally preconditioned coordinates, "
+                           "maxiter={} per cycle".format(self.lbfgs_maxiter))
+        else:
+            logger.writeln("Minimizer: Gauss-Newton, one step per cycle, "
+                           "up to {} step halvings".format(self.ls_trials))
 
     def scale_shifts(self, dx, scale):
         shift_allow_high =  1.0
@@ -879,9 +906,10 @@ class Refine:
         
         self.geom.setup_nonbonded() # if refine_xyz=False, no need to do it every time
         self.geom.setup_target()
-        logger.writeln("vdws = {}".format(len(self.geom.geom.vdws)))
-        logger.writeln(f"atoms = {len(self.params.atoms)}")
-        logger.writeln(f"pairs = {self.geom.geom.target.n_pairs()}")
+        if not self.quiet:
+            logger.writeln("vdws = {}".format(len(self.geom.geom.vdws)))
+            logger.writeln(f"atoms = {len(self.params.atoms)}")
+            logger.writeln(f"pairs = {self.geom.geom.target.n_pairs()}")
 
     def get_x(self):
         return numpy.array(self.params.get_x())
@@ -891,7 +919,8 @@ class Refine:
         geom = self.geom.calc_target(target_only)
         if self.ll is not None:
             ll = self.ll.calc_target()
-            logger.writeln(" ll= {}".format(ll))
+            if not self.quiet:
+                logger.writeln(" ll= {}".format(ll))
             if not target_only:
                 self.ll.calc_grad(self.params, self.geom.geom.specials)
         else:
@@ -901,7 +930,8 @@ class Refine:
         self.ff_grad = None
         if self.ff_prior is not None:
             ff, self.ff_grad = self.ff_prior.calc_target_and_grad(target_only=target_only)
-            logger.writeln(" ff= {}".format(ff))
+            if not self.quiet:
+                logger.writeln(" ff= {}".format(ff))
             if not target_only and not self.ff_weight_determined:
                 self.determine_ff_weight(w)
         self.ff_target = ff
@@ -920,14 +950,93 @@ class Refine:
         if n_ff <= 0:
             logger.writeln("WARNING: force-field gradient is zero; keeping ff_weight = {}".format(self.ff_weight))
         else:
-            self.ff_weight = float(self.ff_weight_auto * n_geom / n_ff)
+            self.ff_weight = max(0., float(self.ff_weight_auto * n_geom / n_ff))
         self.ff_weight_determined = True
         logger.writeln(" gradient norms over xyz: |g_geom|= {:.4e} |w g_exp|= {:.4e} |g_ff|= {:.4e}".format(n_geom, n_ll, n_ff))
         logger.writeln(" ff_weight determined automatically: {:.4g} (|w_ff g_ff|/|g_geom| = {})".format(
             self.ff_weight, self.ff_weight_auto))
 
+    def total_grad(self, weight):
+        """Gradient of the target on the parameter vector (calc_target must have been called with
+        target_only=False). Sign convention: the step is x <- x0 - A^-1 g."""
+        g = numpy.array(self.geom.geom.target.vn)
+        if self.ll is not None:
+            g = g + numpy.array(self.ll.ll.vn) * weight
+        if self.ff_prior is not None and self.ff_grad is not None:
+            g = g + self.ff_grad * self.ff_weight
+        return g
+
+    def shift_limits(self):
+        """Per-parameter trust region, matching the clipping in scale_shifts()."""
+        lim = numpy.full(self.params.n_params(), numpy.inf)
+        for t, v in ((Type.X, 1.0), (Type.B, 30.0), (Type.Q, 0.5), (Type.D, 0.5)):
+            sel = self.params.vec_selection(t)
+            lim[sel] = v
+        return lim
+
+    def run_cycle_lbfgs(self, weight=1):
+        """Minimise the target with L-BFGS-B instead of a single Gauss-Newton step.
+
+        The diagonal of the Gauss-Newton matrix (geometry + data + force field) is used as a
+        preconditioner: the optimisation runs on y = sqrt(diag) * x, so the model Hessian in y is
+        unit-diagonal and L-BFGS builds the remaining curvature (including the off-diagonal
+        coupling the diagonal approximation misses) from the gradient history.
+        Full BFGS is not used: a dense inverse Hessian would be n_params^2 (>10 GB for a
+        typical cryo-EM model), so the limited-memory variant is the only practical choice.
+        """
+        import scipy.optimize
+        f0 = self.calc_target(weight)
+        x0 = self.get_x()
+        logger.writeln("f0= {:.4e}".format(f0))
+        d = self.geom.geom.target.am_spmat.diagonal()
+        if self.ll is not None:
+            d = d + self.ll.ll.fisher_spmat.diagonal() * weight
+        if self.ff_prior is not None:
+            d = d + self.ff_prior.hessian_diag_vector() * self.ff_weight
+        d = numpy.where(d > 0, d + self.lm_damping, 1.)
+        s = numpy.sqrt(d)
+        lim = self.shift_limits() * s
+        y0 = s * x0
+        history = []
+
+        def fun(y):
+            self.set_x(y / s)
+            f = self.calc_target(weight)
+            g = self.total_grad(weight) / s
+            history.append((f, self.ff_target))
+            return f, g
+
+        self.quiet = True
+        try:
+            res = scipy.optimize.minimize(fun, y0, jac=True, method="L-BFGS-B",
+                                          bounds=list(zip(y0 - lim, y0 + lim)),
+                                          options=dict(maxiter=self.lbfgs_maxiter,
+                                                       maxfun=3 * self.lbfgs_maxiter + 10,
+                                                       maxcor=10, ftol=1e-10, gtol=1e-8))
+        finally:
+            self.quiet = False
+        x1 = res.x / s
+        dx = x0 - x1
+        logger.writeln("L-BFGS-B: nit={} nfev={} f={:.4e} ({})".format(
+            res.nit, res.nfev, res.fun, res.message if isinstance(res.message, str) else res.message.decode()))
+        if history:
+            logger.writeln(" f history: {}".format(" ".join("{:.4e}".format(h[0]) for h in history)))
+            if self.ff_prior is not None:
+                logger.writeln(" ff history: {}".format(" ".join("{:.4g}".format(h[1]) for h in history)))
+        self.set_x(x1)
+        f1 = self.calc_target(weight)
+        self.scale_shifts(dx, 1)  # reports min/max/mean and cc with the previous cycle
+        logger.writeln("f1= {:.4e}".format(f1))
+        self.prev_shift = dx
+        if f1 > f0:
+            logger.writeln("WARNING: function not minimised")
+            return False, 1., f1
+        return True, 1., f1
+
     #@profile
     def run_cycle(self, weight=1):
+        if self.minimizer == "lbfgs":
+            return self.run_cycle_lbfgs(weight)
         if 0: # test of grad
             self.ll.update_fc()
             x0 = self.get_x()
@@ -975,9 +1084,22 @@ class Refine:
                 vn += numpy.array(self.ll.ll.vn) * weight
             if self.ff_prior is not None and self.ff_grad is not None:
                 vn += self.ff_grad * self.ff_weight
-                # diagonal (Gauss-Newton) approximation of the force-field Hessian, per parameter
-                am = am + scipy.sparse.diags(self.ff_prior.hessian_diag_vector() * self.ff_weight, format="csr")
+                if self.ff_offdiag:
+                    # Full Gauss-Newton Hessian of the bonded terms (off-diagonal blocks included).
+                    # It is positive semi-definite and ff_weight >= 0, so adding it cannot lower any
+                    # Rayleigh quotient of the normal matrix: a positive definite am stays positive
+                    # definite. The same holds for the diagonal-only branch below.
+                    am = am + self.ff_prior.hessian_matrix() * self.ff_weight
+                else:
+                    # diagonal (Gauss-Newton) approximation of the force-field Hessian, per parameter
+                    am = am + scipy.sparse.diags(self.ff_prior.hessian_diag_vector() * self.ff_weight, format="csr")
+            if self.lm_damping:
+                am = am + scipy.sparse.identity(am.shape[0], format="csr") * self.lm_damping
             diag = am.diagonal()
+            if numpy.any(diag <= 0):
+                logger.writeln("WARNING: {} parameter(s) have a non-positive normal-matrix diagonal; "
+                               "the preconditioner falls back to 1 there (consider --amber_lm_damping)"
+                               .format(int(numpy.count_nonzero(diag <= 0))))
             diag[diag<=0] = 1.
             diag = numpy.sqrt(diag)
             rdiag = 1./diag # sk
@@ -996,7 +1118,7 @@ class Refine:
 
         ret = True # success
         shift_scale = 1
-        for i in range(3):
+        for i in range(self.ls_trials):
             shift_scale = 1/2**i
             dx2 = self.scale_shifts(dx, shift_scale)
             self.set_x(x0 - dx2)
@@ -1014,6 +1136,7 @@ class Refine:
     def run_cycles(self, ncycles, weight=1, weight_adjust=False, debug=False,
                    weight_adjust_bond_rmsz_range=(0.5, 1.), stats_json_out=None):
         self.print_weights()
+        self.print_minimizer()
         stats = [{"Ncyc": 0}]
         self.params.ensure_occ_constraints()
         self.geom.setup_nonbonded()

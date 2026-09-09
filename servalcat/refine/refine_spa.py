@@ -165,6 +165,24 @@ def add_arguments(parser):
     parser.add_argument("--amber_ligand_smiles", nargs="+", default=[], metavar="NAME=SMILES",
                         help="Override the chemistry of a ligand (bond orders/charges) with a SMILES; "
                              "the hydrogen count must match the model")
+    parser.add_argument("--amber_hessian_offdiag", action="store_true",
+                        help="Include the off-diagonal blocks of the AMBER Gauss-Newton Hessian (bond/angle terms). "
+                             "Needs --amber_hessian_mode bonded. Without it the diagonal-only matrix acts as a strong "
+                             "Levenberg-Marquardt damping")
+    parser.add_argument("--amber_minimizer", choices=["gn", "lbfgs"], default="gn",
+                        help="Minimiser: gn = one Gauss-Newton step per cycle (default), "
+                             "lbfgs = L-BFGS-B on the diagonally preconditioned target, which builds the missing "
+                             "curvature from the gradient history instead of from the Hessian")
+    parser.add_argument("--amber_lbfgs_maxiter", type=int, default=20,
+                        help="Maximum L-BFGS-B iterations per cycle (default: %(default)d)")
+    parser.add_argument("--amber_lm_damping", type=float, default=0., metavar="LAMBDA",
+                        help="Levenberg-Marquardt ridge added to the normal matrix diagonal in kJ/mol/A^2. "
+                             "Independent of --amber_weight, so it separates step damping from the strength of "
+                             "the force field; a positive value guarantees a positive definite system "
+                             "(default: %(default)f)")
+    parser.add_argument("--amber_ls_trials", type=int, default=None, metavar="N",
+                        help="Number of Gauss-Newton step halvings in the line search "
+                             "(default: 3, or 8 with --amber_hessian_offdiag)")
     parser.add_argument("--amber_his_state", choices=["HIP", "HIE", "HID"], default="HIP",
                         help="Histidine protonation state in the force field. HIP keeps HD1 and HE2 as generated "
                              "from the monomer library; HIE/HID exclude HD1/HE2 from the force field (default: %(default)s)")
@@ -182,6 +200,8 @@ def parse_args(arg_list):
 def check_amber_args(args):
     """Fail early with a clear message when --amber_enable is combined with unsupported options."""
     if not getattr(args, "amber_enable", False):
+        if args.amber_minimizer != "gn" or args.amber_hessian_offdiag:
+            raise SystemExit("Error: --amber_minimizer / --amber_hessian_offdiag require --amber_enable")
         return
     if args.hydrogen != "all":
         raise SystemExit("Error: --amber_enable requires --hydrogen all (OpenMM residue templates need a complete "
@@ -190,6 +210,18 @@ def check_amber_args(args):
         raise SystemExit("Error: --amber_enable cannot be used with --unrestrained (hydrogen atoms are not generated)")
     if getattr(args, "jellyonly", False):
         raise SystemExit("Error: --amber_enable cannot be used with --jellyonly")
+    for name in ("amber_weight", "amber_hessian_diag", "amber_lbfgs_maxiter", "amber_lm_damping"):
+        if getattr(args, name) is not None and getattr(args, name) < 0:
+            raise SystemExit("Error: --{} must not be negative (got {})".format(name, getattr(args, name)))
+    if args.amber_weight_auto is not None and args.amber_weight_auto < 0:
+        raise SystemExit("Error: --amber_weight_auto must not be negative (got {}); a negative weight would "
+                         "subtract a positive semi-definite matrix and make the normal matrix indefinite"
+                         .format(args.amber_weight_auto))
+    if args.amber_ls_trials is not None and args.amber_ls_trials < 1:
+        raise SystemExit("Error: --amber_ls_trials must be at least 1 (got {})".format(args.amber_ls_trials))
+    if args.amber_hessian_offdiag and args.amber_hessian_mode != "bonded":
+        raise SystemExit("Error: --amber_hessian_offdiag requires --amber_hessian_mode bonded "
+                         "(got {})".format(args.amber_hessian_mode))
 # check_amber_args()
 
 def main(args):
@@ -359,7 +391,12 @@ def main(args):
                      unrestrained=args.unrestrained,
                      ff_prior=ff_prior,
                      ff_weight=args.amber_weight,
-                     ff_weight_auto=args.amber_weight_auto)
+                     ff_weight_auto=args.amber_weight_auto,
+                     ff_offdiag=args.amber_hessian_offdiag,
+                     minimizer=args.amber_minimizer,
+                     lbfgs_maxiter=args.amber_lbfgs_maxiter,
+                     ls_trials=args.amber_ls_trials,
+                     lm_damping=args.amber_lm_damping)
 
     geom.geom.adpr_max_dist = args.max_dist_for_adp_restraint
     if args.adp_restraint_power is not None: geom.geom.adpr_d_power = args.adp_restraint_power

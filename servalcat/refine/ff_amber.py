@@ -16,6 +16,7 @@ from __future__ import absolute_import, division, print_function, generators
 import os
 import tempfile
 import numpy
+import scipy.sparse
 import gemmi
 from servalcat import ext
 from servalcat.utils import logger
@@ -23,6 +24,11 @@ from servalcat.refine import ff_ligand
 
 HIS_STATES = ("HIP", "HIE", "HID")
 HESSIAN_MODES = ("bonded", "const")
+# The angle gradient carries a 1/sin(theta) factor. It stays finite only away from a linear
+# arrangement, so the factor is floored: a (near-)linear angle would otherwise contribute a block
+# with an arbitrarily large norm, which destroys the conditioning of the whole normal matrix and,
+# in floating point, can break the positive semi-definiteness that holds algebraically.
+MIN_SIN_ANGLE = 0.08715574  # sin(5 degrees)
 
 
 def xyz_grad_to_param_grad(grad_xyz, atom_to_param, n_params):
@@ -99,6 +105,106 @@ def select_his_protonation(model, his_state):
     return exclude
 
 
+def _keep_positive(term, k_index):
+    """Filter a (i, j, [k], force_constant) tuple of arrays down to the terms with a positive
+    force constant. Returns (filtered, n_dropped)."""
+    k = term[k_index]
+    keep = k > 0
+    n_dropped = int(numpy.count_nonzero(~keep))
+    if not n_dropped:
+        return term, 0
+    return tuple(a[keep] for a in term), n_dropped
+
+
+def angle_gradients(pos, ai, aj, ak):
+    """Gradients of the angle i-j-k (j central) with respect to the three atoms.
+
+    grad_i theta = (cos t * a_hat - b_hat) / (|a| sin t),  a = r_i - r_j
+    grad_k theta = (cos t * b_hat - a_hat) / (|b| sin t),  b = r_k - r_j
+    grad_j theta = -(grad_i theta + grad_k theta)
+
+    Returns (grad_i, grad_j, grad_k, n_near_linear); sin t is floored at MIN_SIN_ANGLE.
+    """
+    a = pos[ai] - pos[aj]
+    b = pos[ak] - pos[aj]
+    la = numpy.linalg.norm(a, axis=1)
+    lb = numpy.linalg.norm(b, axis=1)
+    ah = a / la[:, None]
+    bh = b / lb[:, None]
+    cos_t = numpy.clip(numpy.sum(ah * bh, axis=1), -1., 1.)
+    sin_t = numpy.sqrt(numpy.maximum(1. - cos_t**2, 0.))
+    n_near_linear = int(numpy.count_nonzero(sin_t < MIN_SIN_ANGLE))
+    sin_t = numpy.maximum(sin_t, MIN_SIN_ANGLE)
+    gi = (cos_t[:, None] * ah - bh) / (la * sin_t)[:, None]
+    gk = (cos_t[:, None] * bh - ah) / (lb * sin_t)[:, None]
+    return gi, -(gi + gk), gk, n_near_linear
+
+
+def bonded_hessian_blocks(pos, bonds, angles, atom_to_param):
+    """Gauss-Newton blocks of the bonded Hessian as (param_idx_a, param_idx_b, (M,3,3)) tuples.
+
+    Each term is E = k/2 q(x)^2, so its Hessian is k (grad q)(grad q)^T + k q grad^2 q; the second
+    part is dropped (Gauss-Newton). What is left is a sum of k * outer(g, g) with k >= 0, which is
+    positive semi-definite by construction - the property the normal matrix relies on.
+
+    Bond  (i,j): H_ii = H_jj = k u u^T, H_ij = -k u u^T with u the bond direction
+    Angle (i,j,k): H_mn = k_theta (grad_m theta)(grad_n theta)^T for the six upper-triangle pairs
+    """
+    a2p = numpy.asarray(atom_to_param, dtype=int)
+    out = []
+    bi, bj, bk = bonds
+    if len(bi):
+        v = pos[bi] - pos[bj]
+        u = v / numpy.linalg.norm(v, axis=1)[:, None]
+        H = bk[:, None, None] * u[:, :, None] * u[:, None, :]
+        out += [(a2p[bi], a2p[bi], H), (a2p[bj], a2p[bj], H), (a2p[bi], a2p[bj], -H)]
+    ai, aj, ak, akth = angles
+    if len(ai):
+        gi, gj, gk, _ = angle_gradients(pos, ai, aj, ak)
+        ps, gs = (a2p[ai], a2p[aj], a2p[ak]), (gi, gj, gk)
+        for m in range(3):
+            for l in range(m, 3):
+                out.append((ps[m], ps[l], akth[:, None, None] * gs[m][:, :, None] * gs[l][:, None, :]))
+    return out
+
+
+def assemble_bonded_hessian(pos, bonds, angles, atom_to_param, n_params, diag_floor=0.):
+    """Sparse Gauss-Newton Hessian of the bonded terms on the parameter vector.
+
+    Positive semi-definite by construction (see bonded_hessian_blocks); diag_floor adds a
+    non-negative diagonal, which cannot make it indefinite and lifts the rigid-body null modes.
+    """
+    rows, cols, vals = [], [], []
+    for pa, pb, H in bonded_hessian_blocks(pos, bonds, angles, atom_to_param):
+        same = pa is pb or numpy.array_equal(pa, pb)
+        ok = (pa >= 0) & (pb >= 0)
+        if not ok.any():
+            continue
+        pa_, pb_, H_ = pa[ok], pb[ok], H[ok]
+        k = numpy.arange(3)
+        r = (pa_[:, None, None] * 3 + k[None, :, None]) * numpy.ones((1, 1, 3), dtype=int)
+        c = (pb_[:, None, None] * 3 + k[None, None, :]) * numpy.ones((1, 3, 1), dtype=int)
+        rows.append(r.ravel()); cols.append(c.ravel()); vals.append(H_.ravel())
+        if not same:
+            # the transposed block: rows/cols are already swapped, so the values stay as they are
+            # (A[3*pb+b, 3*pa+a] = H[a, b] makes the assembled matrix symmetric)
+            rows.append(c.ravel()); cols.append(r.ravel()); vals.append(H_.ravel())
+    if not rows:
+        A = scipy.sparse.csr_matrix((n_params, n_params))
+    else:
+        A = scipy.sparse.coo_matrix((numpy.concatenate(vals),
+                                    (numpy.concatenate(rows), numpy.concatenate(cols))),
+                                   shape=(n_params, n_params)).tocsr()
+    if diag_floor:
+        touched = numpy.zeros(n_params, dtype=bool)
+        a2p = numpy.asarray(atom_to_param, dtype=int)
+        for p in a2p[a2p >= 0]:
+            touched[p*3:p*3+3] = True
+        add = numpy.where(touched, numpy.maximum(diag_floor - A.diagonal(), 0.), 0.)
+        A = A + scipy.sparse.diags(add, format="csr")
+    return A
+
+
 def bonded_hessian_diag(pos, bonds, angles):
     """Gauss-Newton diagonal of the Hessian from harmonic bond and angle terms.
 
@@ -123,17 +229,7 @@ def bonded_hessian_diag(pos, bonds, angles):
         numpy.add.at(d, bj, bk[:, None] * u2)
     ai, aj, ak, akth = angles
     if len(ai):
-        a = pos[ai] - pos[aj]
-        b = pos[ak] - pos[aj]
-        la = numpy.linalg.norm(a, axis=1)
-        lb = numpy.linalg.norm(b, axis=1)
-        ah = a / la[:, None]
-        bh = b / lb[:, None]
-        cos_t = numpy.clip(numpy.sum(ah * bh, axis=1), -1., 1.)
-        sin_t = numpy.sqrt(numpy.maximum(1. - cos_t**2, 1e-12))
-        gi = (cos_t[:, None] * ah - bh) / (la * sin_t)[:, None]
-        gk = (cos_t[:, None] * bh - ah) / (lb * sin_t)[:, None]
-        gj = -(gi + gk)
+        gi, gj, gk, _ = angle_gradients(pos, ai, aj, ak)
         numpy.add.at(d, ai, akth[:, None] * gi**2)
         numpy.add.at(d, ak, akth[:, None] * gk**2)
         numpy.add.at(d, aj, akth[:, None] * gj**2)
@@ -161,6 +257,10 @@ class AmberFFPrior:
         self.n_disulfides = 0
         self.refine_params = refine_params
         self.hessian_diag = float(hessian_diag)  # constant value (const) or floor (bonded), kJ/mol/A^2
+        if self.hessian_diag < 0:
+            raise RuntimeError("hessian_diag must not be negative (got {}): a negative diagonal would "
+                               "make the normal matrix indefinite".format(hessian_diag))
+        self._warned_near_linear = False
         if hessian_mode not in HESSIAN_MODES:
             raise RuntimeError("Unknown hessian mode: {} (choose from {})".format(hessian_mode, HESSIAN_MODES))
         self.hessian_mode = hessian_mode
@@ -341,9 +441,17 @@ class AmberFFPrior:
                     i, j, k, t0, kth = force.getAngleParameters(n)
                     ai.append(i); aj.append(j); ak.append(k)
                     akth.append(kth.value_in_unit(unit.kilojoule_per_mole / unit.radian**2))
-        self._bonds = (numpy.array(bi, dtype=int), numpy.array(bj, dtype=int), numpy.array(bk, dtype=float))
-        self._angles = (numpy.array(ai, dtype=int), numpy.array(aj, dtype=int), numpy.array(ak, dtype=int),
-                        numpy.array(akth, dtype=float))
+        bonds = (numpy.array(bi, dtype=int), numpy.array(bj, dtype=int), numpy.array(bk, dtype=float))
+        angles = (numpy.array(ai, dtype=int), numpy.array(aj, dtype=int), numpy.array(ak, dtype=int),
+                  numpy.array(akth, dtype=float))
+        # A Gauss-Newton block k*outer(g, g) is positive semi-definite only for k >= 0. Force fields
+        # should never give a negative force constant, but drop such terms rather than let them make
+        # the normal matrix indefinite. Zero constants contribute nothing and are dropped too.
+        self._bonds, n_bad_b = _keep_positive(bonds, 2)
+        self._angles, n_bad_a = _keep_positive(angles, 3)
+        if n_bad_b or n_bad_a:
+            logger.writeln("AMBER prior: WARNING: dropped {} bond and {} angle term(s) with a "
+                           "non-positive force constant from the Hessian estimate".format(n_bad_b, n_bad_a))
 
     def _positions_angstrom(self):
         return numpy.array([[a.pos.x, a.pos.y, a.pos.z] for a in self._ff_atoms], dtype=float)
@@ -375,6 +483,43 @@ class AmberFFPrior:
             j = int(pidx) * 3
             d[j:j+3] = da[i_atom]
         return d
+
+    def hessian_blocks(self):
+        """Gauss-Newton blocks of the bonded Hessian at the current coordinates."""
+        return bonded_hessian_blocks(self._positions_angstrom(), self._bonds, self._angles,
+                                     self._atom_to_param_x)
+
+    def hessian_matrix(self):
+        """Sparse Hessian estimate on the refinement parameter vector, including the off-diagonal
+        blocks that couple bonded atoms. The diagonal is identical to hessian_diag_vector().
+
+        Positive semi-definite by construction: a sum of k*outer(g, g) with k >= 0 (non-positive
+        force constants are dropped in _extract_bonded_terms) plus a non-negative diagonal floor.
+        """
+        if self.hessian_mode != "bonded":
+            raise RuntimeError("off-diagonal Hessian is only available with hessian_mode='bonded' "
+                               "(got '{}')".format(self.hessian_mode))
+        pos = self._positions_angstrom()
+        self._warn_near_linear_angles(pos)
+        A = assemble_bonded_hessian(pos, self._bonds, self._angles, self._atom_to_param_x,
+                                    self.refine_params.n_params())
+        # same floor as hessian_diag_vector(): the bonded Hessian is rank-deficient (rigid-body
+        # modes), so without it the total matrix can be singular. A non-negative diagonal cannot
+        # make a positive semi-definite matrix indefinite.
+        dv = self.hessian_diag_vector()
+        return A + scipy.sparse.diags(numpy.maximum(dv - A.diagonal(), 0.), format="csr")
+
+    def _warn_near_linear_angles(self, pos):
+        """Report once if any angle is close enough to linear for the 1/sin(theta) floor to bite."""
+        ai, aj, ak, _ = self._angles
+        if not len(ai) or self._warned_near_linear:
+            return
+        _, _, _, n = angle_gradients(pos, ai, aj, ak)
+        if n:
+            self._warned_near_linear = True
+            logger.writeln("AMBER prior: WARNING: {} angle(s) within {:.1f} deg of linear; the 1/sin(theta) "
+                           "factor of the Hessian estimate is clamped there".format(
+                               n, numpy.degrees(numpy.arcsin(MIN_SIN_ANGLE))))
 
     def calc_target_and_grad(self, target_only=False):
         self._context.setPositions(self._positions_nm())

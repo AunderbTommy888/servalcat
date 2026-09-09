@@ -12,6 +12,39 @@ from servalcat import ext
 import gemmi
 
 
+class FakePrior:
+    """Minimal stand-in for AmberFFPrior: a quadratic well in parameter space, read through the
+    RefineParams object exactly like the real prior reads the gemmi atoms. No OpenMM needed."""
+    hessian_diag = 1000.
+    hessian_mode = "const"
+    his_state = "HIP"
+
+    def __init__(self, params, k=1000., offset=0.1):
+        self.params = params
+        self.n = params.n_params()
+        self.k = k
+        # the minimum sits away from the current parameters, so the gradient is non-zero there
+        self.x0 = numpy.array(params.get_x()) - offset
+
+    def _d(self):
+        return numpy.array(self.params.get_x()) - self.x0
+
+    def calc_target_and_grad(self, target_only=False):
+        d = self._d()
+        f = 0.5 * self.k * float(numpy.dot(d, d))
+        return f, (None if target_only else self.k * d)
+
+    def hessian_diag_vector(self):
+        return numpy.full(self.n, self.k)
+
+    def hessian_matrix(self):
+        import scipy.sparse
+        off = 0.1 * self.k  # small symmetric coupling between neighbouring parameters
+        m = scipy.sparse.diags([numpy.full(self.n - 1, off), numpy.full(self.n, float(self.k)),
+                                numpy.full(self.n - 1, off)], [-1, 0, 1], format="csr")
+        return m
+
+
 class TestAmberPhase1(unittest.TestCase):
     @staticmethod
     def _renumber_serials(st):
@@ -42,6 +75,11 @@ class TestAmberPhase1(unittest.TestCase):
         self.assertEqual(refine_spa.parse_args(["--halfmaps", "a", "b", "--model", "m.pdb", "-d", "3.0",
                                                 "--amber_weight_auto", "0.5"]).amber_weight_auto, 0.5)
         self.assertEqual(args.amber_hessian_mode, "bonded")
+        self.assertFalse(args.amber_hessian_offdiag)
+        self.assertEqual(args.amber_minimizer, "gn")
+        self.assertEqual(args.amber_lbfgs_maxiter, 20)
+        self.assertEqual(args.amber_lm_damping, 0.)
+        self.assertIsNone(args.amber_ls_trials)
         self.assertEqual(args.amber_his_state, "HIP")
         self.assertEqual(args.amber_forcefield, ["amber14-all.xml", "amber14/tip3p.xml"])
 
@@ -56,6 +94,8 @@ class TestAmberPhase1(unittest.TestCase):
             "--amber_platform", "CPU",
             "--amber_hessian_diag", "7.5",
             "--amber_hessian_mode", "const",
+            "--amber_minimizer", "lbfgs",
+            "--amber_lbfgs_maxiter", "7",
             "--amber_his_state", "HIE",
             "--amber_forcefield", "amber14-all.xml", "amber14/tip3p.xml",
         ])
@@ -65,6 +105,8 @@ class TestAmberPhase1(unittest.TestCase):
         self.assertEqual(args.amber_platform, "CPU")
         self.assertAlmostEqual(args.amber_hessian_diag, 7.5)
         self.assertEqual(args.amber_hessian_mode, "const")
+        self.assertEqual(args.amber_minimizer, "lbfgs")
+        self.assertEqual(args.amber_lbfgs_maxiter, 7)
         self.assertEqual(args.amber_his_state, "HIE")
 
     def test_check_amber_args(self):
@@ -77,6 +119,15 @@ class TestAmberPhase1(unittest.TestCase):
         refine_spa.check_amber_args(refine_spa.parse_args(base[:-1] + ["--hydrogen", "no"]))
         with self.assertRaises(SystemExit):  # PME is no longer a valid choice
             refine_spa.parse_args(base + ["--amber_nonbonded", "PME"])
+        # off-diagonal Hessian needs the bonded mode
+        refine_spa.check_amber_args(refine_spa.parse_args(base + ["--amber_hessian_offdiag"]))
+        with self.assertRaises(SystemExit):
+            refine_spa.check_amber_args(refine_spa.parse_args(
+                base + ["--amber_hessian_offdiag", "--amber_hessian_mode", "const"]))
+        # minimiser / off-diagonal options require --amber_enable
+        for extra in (["--amber_minimizer", "lbfgs"], ["--amber_hessian_offdiag"]):
+            with self.assertRaises(SystemExit):
+                refine_spa.check_amber_args(refine_spa.parse_args(base[:-1] + extra))
 
     def test_xyz_grad_to_param_grad(self):
         grad_xyz = numpy.array([
@@ -159,14 +210,7 @@ class TestAmberPhase1(unittest.TestCase):
         geom.setup_nonbonded()
         geom.setup_target()
 
-        class FakePrior:
-            hessian_diag = 1000.; hessian_mode = "const"; his_state = "HIP"
-            def __init__(self, n): self.n = n
-            def calc_target_and_grad(self, target_only=False):
-                g = numpy.arange(1, self.n + 1, dtype=float)
-                return 5.0, (None if target_only else g)
-            def hessian_diag_vector(self): return numpy.full(self.n, 1000.)
-        prior = FakePrior(rp.n_params())
+        prior = FakePrior(rp)
         ref = Refine(st, geom, cfg, rp, ll=None, ff_prior=prior, ff_weight=0.1, ff_weight_auto=0.5)
         self.assertFalse(ref.ff_weight_determined)
         ref.calc_target(1)
@@ -178,6 +222,206 @@ class TestAmberPhase1(unittest.TestCase):
         w1 = ref.ff_weight
         ref.calc_target(1)  # determined once only
         self.assertEqual(ref.ff_weight, w1)
+
+    def _geom_setup(self, shake=0.3):
+        from servalcat.refine.refine import Geom, load_config
+        from servalcat.refmac import refmac_keywords
+        st = utils.fileio.read_structure("tests/biotin/biotin_talos.pdb")
+        monlib = utils.restraints.load_monomer_library(st)
+        topo, _ = utils.restraints.prepare_topology(st, monlib, h_change=gemmi.HydrogenChange.NoChange)
+        self._renumber_serials(st)
+        params = refmac_keywords.parse_keywords([])
+        cfg = load_config(None, None, params)
+        rp = RefineParams(st, refine_xyz=True, adp_mode=0, refine_occ=False, refine_dfrac=False, cfg=cfg)
+        geom = Geom(st, topo, monlib, rp, cfg, shake_rms=shake, params=params)
+        geom.setup_nonbonded()
+        geom.setup_target()
+        return st, rp, geom, cfg
+
+    def test_run_cycle_lbfgs(self):
+        """L-BFGS version: diagonal-only Hessian used as preconditioner, curvature from gradient history."""
+        if "CLIBD_MON" not in os.environ:
+            self.skipTest("CLIBD_MON is not set")
+        from servalcat.refine.refine import Refine
+        st, rp, geom, cfg = self._geom_setup()
+        prior = FakePrior(rp)
+        ref = Refine(st, geom, cfg, rp, ll=None, ff_prior=prior, ff_weight=0.05,
+                     minimizer="lbfgs", lbfgs_maxiter=15)
+        x0 = ref.get_x()
+        f0 = ref.calc_target(1)
+        ok, scale, f1 = ref.run_cycle(weight=1)
+        self.assertTrue(ok)
+        self.assertLess(f1, f0)
+        self.assertGreater(numpy.abs(ref.get_x() - x0).max(), 1e-6)
+        # the trust region of scale_shifts must be respected
+        self.assertLessEqual(numpy.abs(ref.get_x() - x0).max(), 1.0 + 1e-9)
+        self.assertFalse(ref.quiet)  # restored after the inner iterations
+
+    def test_lm_damping_makes_matrix_positive_definite(self):
+        """A positive Levenberg-Marquardt ridge lifts the rigid-body null modes, so the normal
+        matrix is strictly positive definite instead of only semi-definite."""
+        if "CLIBD_MON" not in os.environ:
+            self.skipTest("CLIBD_MON is not set")
+        from servalcat.refine.refine import Refine
+        st, rp, geom, cfg = self._geom_setup(shake=0.0)
+        prior = FakePrior(rp)
+        geom.calc_target(False)
+        Hg = geom.geom.target.am_spmat.toarray()
+        ev0 = numpy.linalg.eigvalsh((Hg + Hg.T) / 2)
+        self.assertGreater(ev0.min(), -1e-6 * abs(ev0).max())   # restraints alone: PSD
+        for lam in (10., 100.):
+            A = Hg + lam * numpy.eye(rp.n_params())
+            self.assertGreater(numpy.linalg.eigvalsh((A + A.T) / 2).min(), lam * 0.99)
+        # a negative ridge is refused
+        with self.assertRaises(RuntimeError):
+            Refine(st, geom, cfg, rp, ll=None, ff_prior=prior, ff_weight=0.05, lm_damping=-1.)
+        # and a cycle with the ridge still decreases the target
+        ref = Refine(st, geom, cfg, rp, ll=None, ff_prior=prior, ff_weight=0.05,
+                     ff_offdiag=True, lm_damping=100.)
+        f0 = ref.calc_target(1)
+        ok, _, f1 = ref.run_cycle(weight=1)
+        self.assertTrue(ok)
+        self.assertLess(f1, f0)
+
+    def test_run_cycle_offdiag_hessian(self):
+        """Off-diagonal version: same Gauss-Newton cycle, full force-field Hessian in the matrix."""
+        if "CLIBD_MON" not in os.environ:
+            self.skipTest("CLIBD_MON is not set")
+        from servalcat.refine.refine import Refine
+        res = {}
+        for offdiag in (False, True):
+            st, rp, geom, cfg = self._geom_setup()
+            prior = FakePrior(rp)
+            ref = Refine(st, geom, cfg, rp, ll=None, ff_prior=prior, ff_weight=0.05, ff_offdiag=offdiag)
+            x0 = ref.get_x()
+            f0 = ref.calc_target(1)
+            ok, scale, f1 = ref.run_cycle(weight=1)
+            self.assertTrue(ok)
+            self.assertLess(f1, f0)
+            res[offdiag] = ref.get_x() - x0
+        # the off-diagonal terms must change the step
+        self.assertGreater(numpy.abs(res[True] - res[False]).max(), 1e-6)
+
+    def test_bonded_hessian_is_positive_semidefinite(self):
+        """The assembled bonded Hessian must never have a negative eigenvalue: the normal matrix
+        relies on it (adding a PSD matrix with a non-negative weight preserves positive definiteness).
+        Synthetic geometries, no OpenMM needed."""
+        from servalcat.refine.ff_amber import (assemble_bonded_hessian, bonded_hessian_diag,
+                                               angle_gradients, MIN_SIN_ANGLE)
+        rng = numpy.random.default_rng(0)
+        cases = {}
+        # water-like, bent
+        r0, t0 = 0.9572, numpy.deg2rad(104.52)
+        cases["bent"] = numpy.array([[0., 0., 0.], [r0, 0., 0.],
+                                     [r0*numpy.cos(t0), r0*numpy.sin(t0), 0.]])
+        # nearly linear (the pathological case for the 1/sin(theta) factor)
+        for deg in (179.0, 179.999, 180.0):
+            t = numpy.deg2rad(deg)
+            cases["linear_%s" % deg] = numpy.array([[0., 0., 0.], [r0, 0., 0.],
+                                                    [r0*numpy.cos(t), r0*numpy.sin(t), 0.]])
+        # random cloud
+        cases["random"] = rng.normal(size=(3, 3))
+        bonds = (numpy.array([1, 2]), numpy.array([0, 0]), numpy.array([4627.5, 4627.5]))
+        angles = (numpy.array([1]), numpy.array([0]), numpy.array([2]), numpy.array([836.8]))
+        a2p = numpy.array([0, 1, 2])
+        for name, pos in cases.items():
+            A = assemble_bonded_hessian(pos, bonds, angles, a2p, 9).toarray()
+            self.assertLess(numpy.abs(A - A.T).max(), 1e-8, name)
+            ev = numpy.linalg.eigvalsh(A)
+            self.assertGreater(ev.min(), -1e-6 * max(1., numpy.abs(A).max()), "%s: %s" % (name, ev[:3]))
+            # the diagonal must agree with the per-atom estimate used by the diagonal-only version
+            numpy.testing.assert_allclose(numpy.diag(A), bonded_hessian_diag(pos, bonds, angles).ravel(),
+                                          rtol=1e-9, atol=1e-8)
+            # rigid-body modes: translation and (for a rigid rotation) zero curvature
+            for ax in range(3):
+                t = numpy.zeros(9); t[ax::3] = 1.
+                self.assertLess(abs(float(t @ A @ t)), 1e-6 * numpy.abs(A).max(), name)
+            # a floor only adds a non-negative diagonal, so it cannot break PSD
+            Af = assemble_bonded_hessian(pos, bonds, angles, a2p, 9, diag_floor=1000.).toarray()
+            self.assertGreaterEqual(numpy.linalg.eigvalsh(Af).min(), -1e-6 * numpy.abs(Af).max())
+            self.assertTrue(numpy.all(numpy.diag(Af) >= 1000. - 1e-6), name)
+        # the 1/sin(theta) factor must be clamped, not infinite
+        gi, gj, gk, n = angle_gradients(cases["linear_180.0"], numpy.array([1]), numpy.array([0]), numpy.array([2]))
+        self.assertEqual(n, 1)
+        self.assertTrue(numpy.all(numpy.isfinite(gi)) and numpy.all(numpy.isfinite(gk)))
+        self.assertLessEqual(numpy.abs(gi).max(), 1. / (r0 * MIN_SIN_ANGLE) + 1e-9)
+
+    def test_non_positive_force_constants_are_dropped(self):
+        """A negative force constant would make the Gauss-Newton block negative semi-definite."""
+        from servalcat.refine.ff_amber import _keep_positive
+        bonds = (numpy.array([0, 1, 2]), numpy.array([1, 2, 3]), numpy.array([100., -5., 0.]))
+        kept, n = _keep_positive(bonds, 2)
+        self.assertEqual(n, 2)
+        numpy.testing.assert_array_equal(kept[2], [100.])
+        numpy.testing.assert_array_equal(kept[0], [0])
+        angles = (numpy.array([0]), numpy.array([1]), numpy.array([2]), numpy.array([50.]))
+        kept, n = _keep_positive(angles, 3)
+        self.assertEqual(n, 0)
+        self.assertIs(kept, angles)
+
+    def test_negative_weights_rejected(self):
+        base = ["--halfmaps", "a", "b", "--model", "m.pdb", "-d", "3.0", "--amber_enable"]
+        for extra in (["--amber_weight", "-0.1"], ["--amber_weight_auto", "-1"],
+                      ["--amber_hessian_diag", "-1"], ["--amber_ls_trials", "0"],
+                      ["--amber_lm_damping", "-1"]):
+            with self.assertRaises(SystemExit, msg=str(extra)):
+                refine_spa.check_amber_args(refine_spa.parse_args(base + extra))
+        with self.assertRaises(RuntimeError):  # also guarded in the prior itself
+            from servalcat.refine.ff_amber import AmberFFPrior as P
+            P.__init__.__wrapped__ if False else None
+            st = utils.fileio.read_structure("tests/biotin/biotin_talos.pdb")
+            self._renumber_serials(st)
+            rp = RefineParams(st, refine_xyz=True, adp_mode=0, refine_occ=False, refine_dfrac=False, cfg=None)
+            P(st, rp, platform_name="Reference", hessian_diag=-1.)
+
+    def test_hessian_matrix_offdiag(self):
+        """hessian_matrix(): symmetric, diagonal identical to hessian_diag_vector(), and the
+        bonded Gauss-Newton Hessian keeps its rigid-body null mode when the floor is disabled."""
+        try:
+            import openmm  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenMM is not installed")
+        if "CLIBD_MON" not in os.environ:
+            self.skipTest("CLIBD_MON is not set")
+        import scipy.sparse
+        st = utils.fileio.read_structure("tests/1l2h/1l2h.cif.gz")
+        self._remove_waters(st)
+        self._renumber_serials(st)
+        monlib = utils.restraints.load_monomer_library(st)
+        utils.restraints.add_hydrogens(st, monlib, "nucl")
+        self._renumber_serials(st)
+        rp = RefineParams(st, refine_xyz=True, adp_mode=0, refine_occ=False, refine_dfrac=False, cfg=None)
+        prior = AmberFFPrior(st, rp, platform_name="Reference", his_state="HIE")
+        A = prior.hessian_matrix()
+        self.assertEqual(A.shape, (rp.n_params(), rp.n_params()))
+        self.assertLess(abs(A - A.T).max(), 1e-6)
+        numpy.testing.assert_allclose(A.diagonal(), prior.hessian_diag_vector(), rtol=1e-9, atol=1e-6)
+        self.assertGreater(A.nnz, (A.diagonal() != 0).sum())  # off-diagonal entries exist
+        # plain-loop reference
+        B = scipy.sparse.lil_matrix(A.shape)
+        for pa, pb, H in prior.hessian_blocks():
+            same = numpy.array_equal(pa, pb)
+            for m in range(len(pa)):
+                i, j = int(pa[m]), int(pb[m])
+                if i < 0 or j < 0:
+                    continue
+                B[i*3:i*3+3, j*3:j*3+3] += H[m]
+                if not same:
+                    B[j*3:j*3+3, i*3:i*3+3] += H[m].T
+        B = B.tocsr()
+        dv = prior.hessian_diag_vector()
+        B = B + scipy.sparse.diags(numpy.maximum(dv - B.diagonal(), 0.), format="csr")
+        self.assertLess(abs(A - B).max(), 1e-6)
+        # rigid-body null mode with the floor disabled
+        prior0 = AmberFFPrior(st, rp, platform_name="Reference", his_state="HIE", hessian_diag=0.)
+        A0 = prior0.hessian_matrix()
+        a2p = numpy.asarray(prior0._atom_to_param_x)
+        for ax in range(3):
+            t = numpy.zeros(rp.n_params())
+            t[a2p[a2p >= 0]*3 + ax] = 1.
+            self.assertLess(abs(float(t @ (A0 @ t))), 1e-5 * A0.diagonal().max())
+        with self.assertRaises(RuntimeError):  # const mode has no off-diagonal Hessian
+            AmberFFPrior(st, rp, platform_name="Reference", hessian_mode="const").hessian_matrix()
 
     def test_bonded_hessian_diag_matches_finite_difference(self):
         # water-like 3-atom system at equilibrium: Gauss-Newton diagonal equals the exact Hessian diagonal

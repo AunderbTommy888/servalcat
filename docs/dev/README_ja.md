@@ -14,8 +14,8 @@
    - 実験項 + AMBER 力場項を併用する Phase 1 実装の設計図と進捗。
 
 4. `amber_hessian_protonation_note_ja.md`
-   - AMBER エネルギー増加の原因調査と修正の解説 (対角 Hessian の導出、水素の核位置調整、プロトン化状態、
-     リガンドへの OpenFF 力場割り当て)。
+   - AMBER 項の技術解説。対角 Hessian の導出、水素の核位置調整、プロトン化状態、リガンドへの OpenFF 力場割り当て、
+     非対角成分の計算方法と正定値性 (8 節)。
 
 5. `amber_weight_study_note_ja.md`
    - 対角 Hessian・水素位置・重み走査・クロスバリデーション・自動重みの検討を図とともにまとめたノート。
@@ -26,6 +26,9 @@
 
 7. `examples/scan_amber_weight_7db6.sh`
    - 7db6 で `--amber_weight` を走査し FSC / E_AMBER / 幾何指標を表にする (クロスバリデーション対応)。
+
+8. `examples/compare_amber_minimizers.py`
+   - 最適化器 3 版 (GN+対角 / GN+非対角 / L-BFGS) の実行結果を表にまとめる。
 
 ## この階層での運用方針
 

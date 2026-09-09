@@ -62,6 +62,11 @@ $$
 - `--amber_hessian_diag` (既定 1000 kJ/mol/Å²: `const` モードでは値そのもの、`bonded` モードではフロア)
 - `--amber_hessian_mode` (`bonded` | `const`, 既定 `bonded`)
 - `--amber_his_state` (`HIP` | `HIE` | `HID`, 既定 `HIP`)
+- `--amber_hessian_offdiag` (結合・結合角の Gauss-Newton 非対角ブロックを行列に入れる。`bonded` モード限定)
+- `--amber_minimizer` (`gn` | `lbfgs`, 既定 `gn`)、`--amber_lbfgs_maxiter` (既定 20)
+- `--amber_ls_trials` (Gauss-Newton の直線探索の半分割回数。既定 3、非対角時は 8)
+- `--amber_lm_damping` (正規方程式の対角に足す Levenberg-Marquardt リッジ。既定 0。重みと独立で、
+  正の値で行列が厳密に正定値になる)
 
 詳細な導出と検証は `amber_hessian_protonation_note_ja.md`、重みと Hessian の検討 (図付き) は `amber_weight_study_note_ja.md` を参照。
 
@@ -88,13 +93,26 @@ $$
 3. 力場適用範囲
 - 標準残基は比較的通りやすいが、リガンドは追加 XML が必要な場合がある。
 
-4. Hessian の対角近似
+4. Hessian の近似と最適化器
 - 厳密な Hessian は使わず対角近似で統合する。
 - `bonded` モード (既定): OpenMM の調和結合・結合角パラメータから Gauss-Newton 対角を原子ごとに毎サイクル計算し、
   `amber_hessian_diag` をフロアとする。有限差分 (結合+角) と 1〜4% で一致する。
 - `const` モード: 全パラメータ共通の定数 `amber_hessian_diag` (旧挙動)。
 - 旧既定の定数 10 は真の曲率 (H で約 1,300、重原子で約 5,000 kJ/mol/Å²) の 1/100 以下で、
   幾何拘束に曲率が無い水の回転モードで水素が飛ぶ原因になっていた。
+- 対角のみの近似は Levenberg-Marquardt 型の減衰として働く。結合項の Hessian は剛体モードに零固有値を持つので、
+  非対角を落とすと集団運動に原子あたり約 3,000 kJ/mol/Å² の剛性が付く。7dy0 では非対角を入れると
+  同じ勾配に対するステップが 6.1 倍長くなり、方向の余弦は 0.475 だった。
+- `--amber_hessian_offdiag` で非対角ブロックを入れられる (`hessian_matrix()`)。減衰が消えるので
+  直線探索の半分割回数を増やす必要がある (既定 8)。
+- `--amber_minimizer lbfgs` は対角を前処理に使い、残りの曲率を勾配履歴から作る L-BFGS-B 版
+  (`run_cycle_lbfgs()`)。密な BFGS はパラメータ数の二乗のメモリが必要で使えない。
+- 正定値性: 結合・結合角の Gauss-Newton ブロックは $k \ge 0$ の外積和なので半正定値。
+  $k \le 0$ の項は除外し、結合角勾配の $1/\sin\theta$ は $\sin 5^\circ$ で下限を切り、
+  重みとフロアは非負を強制する。幾何拘束自体が剛体零モードを持つため厳密な正定値には
+  `--amber_lm_damping` が必要。導出と検証は `amber_hessian_protonation_note_ja.md` 8 節、
+  実測と減衰の効果は `amber_weight_study_note_ja.md` 7.4 節。
+- 3 版の比較は `amber_weight_study_note_ja.md` 7 節。
 
 5. Alternate conformation (altloc)
 - OpenMM の `PDBFile` は最初の altloc しか読まないため、そのまま渡すと原子数不一致になる。
@@ -305,6 +323,9 @@ OpenMM が「Multiple non-identical matching templates」で失敗する (7db6 �
 - [x] ジスルフィド結合 CYS の CYX テンプレート固定
 - [x] 7db6 での `--amber_weight` 走査 (FSC / クロスバリデーション / E_AMBER / 幾何) と走査スクリプト
 - [x] `--amber_weight_auto` (勾配ノルム比) の実装、stats JSON への `ff` / `ff_weight` 出力、7db6・7dy0 での確認
+- [x] 非対角 Hessian 版 (`--amber_hessian_offdiag`) と L-BFGS 版 (`--amber_minimizer lbfgs`) の実装と比較
+- [x] 明示的な LM 減衰 (`--amber_lm_damping`) と Hessian 正定値性の保証・検証
+- [ ] 非対角版・L-BFGS 版での重み (と λ) の再走査
 - [ ] His の残基ごとのプロトン化指定
 - [ ] 共有結合したリガンド・修飾残基への対応
 

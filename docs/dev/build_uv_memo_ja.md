@@ -286,7 +286,7 @@ CLIBD_MON="$PWD/third_party/monomers" PATH="$PWD/.venv-openff/bin:$PATH" \
 | `test_xtal.py` | 5 件 OK (1 件 skip: `refmac unavailable`) |
 | `test_spa.py` | 9 件 OK (1 件 skip: `refmac unavailable`) |
 | `test_refine.py` | 11 件 OK (約 100 秒) |
-| `test_amber_phase1.py` | 13 件 (メイン venv では OpenFF 依存 2 件 skip、OpenFF 環境では全件 OK) |
+| `test_amber_phase1.py` | 20 件 (メイン venv では OpenFF 依存 2 件 skip、OpenFF 環境では全件 OK) |
 
 skip される 2 件は REFMAC5 が PATH に無いためで、CCP4 未導入環境では期待通りの挙動。
 
@@ -377,6 +377,43 @@ EXTRA_ARGS="--cross_validation" bash docs/dev/examples/scan_amber_weight_7db6.sh
 
 結果ファイルは `work/7db6_weight_scan/w*/` と `work/7db6_weight_scan_cv/w*/` (各 `refined.log`, `refined_stats.json`,
 `refined.mmcif`, マップ)。
+
+## 最適化器の 2 バージョン
+
+対角のみの力場 Hessian は実質的に減衰として働くため、それを分離した 2 版がある。
+
+```bash
+cd "$PROJECT_ROOT"
+# (a) 非対角 Hessian を入れて従来の Gauss-Newton で解く
+.venv-openff/bin/python -m servalcat refine_spa_norefmac ... --amber_enable --amber_hessian_offdiag
+# (b) 対角のままで L-BFGS-B で最小化する
+.venv-openff/bin/python -m servalcat refine_spa_norefmac ... --amber_enable --amber_minimizer lbfgs --amber_lbfgs_maxiter 20
+```
+
+この環境での比較 (5 サイクル、自動重み R = 0.3、HIE、CPU):
+
+| 系 | 版 | E_AMBER 最終 | 結合 rmsZ | FSC(full) | 実行時間 |
+|---|---|---:|---:|---:|---:|
+| 7dy0 | GN + 対角 (既定) | −8,448 | 0.569 | 0.9475 | 18 s |
+| 7dy0 | GN + 非対角 | −9,106 | 0.604 | 0.9500 | 20 s |
+| 7dy0 | L-BFGS + 対角 | −9,342 | 0.594 | 0.9493 | 377 s |
+| 7db6 | GN + 対角 (既定) | −60,161 | 0.590 | 0.7933 | 63 s |
+| 7db6 | GN + 非対角 | −56,244 | 1.217 | 0.8032 | 89 s |
+| 7db6 | L-BFGS + 対角 | −51,618 | 0.684 | 0.8275 | 648 s |
+
+注意:
+
+- 非対角版は最初の数サイクルで結合 rmsZ が跳ねる (7db6 で 1.60 まで)。`--amber_lm_damping 100` を併用すると
+  E_AMBER が単調に減り、跳ね上がりも消える (7dy0 で確認)。既定の直線探索回数は非対角時に自動で 8 になる。
+- Hessian は構成上半正定値 (力定数が負の項は除外、結合角の 1/sin は sin5° で下限、重みとフロアは非負)。
+  厳密な正定値には `--amber_lm_damping` が必要。幾何拘束自体が剛体零モードを持つため。
+  背景は `amber_hessian_protonation_note_ja.md` 8 節 (非対角の計算方法、数値検証、正定値性)。
+- L-BFGS 版は安定だが 10〜20 倍遅い。7db6 では毎サイクル maxiter に達して未収束。
+- 目的関数値 f はラン間で比較できない (毎サイクル ML パラメータを再推定するため)。
+  比較は FSC、E_AMBER、幾何 rmsZ で行う。
+- 結果ファイルは `work/minimizer_study/`、集計は
+  `.venv-openff/bin/python docs/dev/examples/compare_amber_minimizers.py work/minimizer_study/*/`。
+- 背景と議論は `amber_weight_study_note_ja.md` 7 節。
 
 ## `--amber_weight_auto` (勾配ノルム比による自動重み)
 
