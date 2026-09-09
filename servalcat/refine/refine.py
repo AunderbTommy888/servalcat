@@ -748,7 +748,7 @@ class Refine:
     def __init__(self, st, geom, cfg, refine_params, ll=None, unrestrained=False,
                  ff_prior=None, ff_weight=0., ff_weight_auto=None,
                  ff_offdiag=False, minimizer="gn", lbfgs_maxiter=20, ls_trials=None,
-                 lm_damping=0.):
+                 lm_damping=0., geom_weights_full=None):
         assert geom is not None
         self.st = st # clone()?
         self.st_traj = None
@@ -769,6 +769,9 @@ class Refine:
         # explicit Levenberg-Marquardt ridge on the normal matrix, in the units of its diagonal.
         # geometry + data are positive semi-definite and the force-field term is too, so a positive
         # ridge is what guarantees a strictly positive definite (hence solvable) system.
+        # per-atom geometry weights before the force field replaced the restraints, kept so the
+        # geometry statistics can still be reported (see model_stats())
+        self.geom_weights_full = geom_weights_full
         self.lm_damping = float(lm_damping)
         if self.lm_damping < 0:
             raise RuntimeError("lm_damping must not be negative (got {})".format(lm_damping))
@@ -817,6 +820,21 @@ class Refine:
             logger.writeln("  hessian off-diagonal: {}".format(self.ff_offdiag))
             if self.lm_damping:
                 logger.writeln("  Levenberg-Marquardt ridge: {}".format(self.lm_damping))
+
+    def model_stats(self, show_outliers=True):
+        """Geometry statistics. A restraint whose weight is zero drops out of the report, so once the
+        force field has replaced the classical restraints the bond/angle rmsZ would disappear. Restore
+        the pre-replacement weights for the reporting pass only: the numbers stay available as a
+        diagnostic and keep driving the automatic weight adjustment, while the target is unchanged."""
+        if self.geom_weights_full is None:
+            return self.geom.show_model_stats(show_outliers=show_outliers)
+        w = self.params.geom_weights
+        saved = numpy.array(w, copy=True)
+        w[:] = self.geom_weights_full
+        try:
+            return self.geom.show_model_stats(show_outliers=show_outliers)
+        finally:
+            w[:] = saved
 
     def print_minimizer(self):
         if self.minimizer == "lbfgs":
@@ -1145,7 +1163,7 @@ class Refine:
         logger.writeln("vdws = {}".format(len(self.geom.geom.vdws)))
         logger.writeln(f"atoms = {len(self.params.atoms)}")
         logger.writeln(f"pairs = {self.geom.geom.target.n_pairs()}")
-        stats[-1]["geom"] = self.geom.show_model_stats(show_outliers=True)
+        stats[-1]["geom"] = self.model_stats(show_outliers=True)
         if self.params.occ_group_constraints:
             stats[-1]["occ_const"] = {"lambda": self.geom.const_ls,
                                       "mu": self.geom.const_u,
@@ -1185,7 +1203,7 @@ class Refine:
             if occ_refine_flag:
                 stats[-1]["occ_refine"] = self.geom.group_occ.refine(self.ll)
             if debug: utils.fileio.write_model(self.st, "refined_{:02d}".format(i+1), pdb=True)#, cif=True)
-            stats[-1]["geom"] = self.geom.show_model_stats(show_outliers=(i==ncycles-1))
+            stats[-1]["geom"] = self.model_stats(show_outliers=(i==ncycles-1))
             if self.params.occ_group_constraints:
                 viols = self.geom.update_occ_consts(consts_prev=stats[-2]["occ_const"]["violation"],
                                                     alpha=self.cfg.occ_group_const_mu_update_factor,

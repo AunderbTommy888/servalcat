@@ -65,10 +65,15 @@ class TestAmberPhase1(unittest.TestCase):
             "-d", "3.0",
         ])
         self.assertFalse(args.amber_enable)
-        self.assertAlmostEqual(args.amber_weight, 0.1)
         self.assertEqual(args.amber_nonbonded, "NoCutoff")
         self.assertEqual(args.amber_platform, "Reference")
         self.assertEqual(args.amber_hessian_diag, 1000.0)
+        self.assertEqual(args.amber_replace_geom, 1.0)   # full replacement by default
+        self.assertIsNone(args.amber_weight)
+        self.assertEqual(refine_spa.resolve_amber_weight(args), 1.0)
+        self.assertEqual(refine_spa.resolve_amber_weight(
+            refine_spa.parse_args(["--halfmaps", "a", "b", "--model", "m.pdb", "-d", "3.0",
+                                   "--amber_replace_geom", "0"])), 0.1)
         self.assertIsNone(args.amber_weight_auto)
         self.assertEqual(refine_spa.parse_args(["--halfmaps", "a", "b", "--model", "m.pdb", "-d", "3.0",
                                                 "--amber_weight_auto"]).amber_weight_auto, 0.3)
@@ -101,6 +106,7 @@ class TestAmberPhase1(unittest.TestCase):
         ])
         self.assertTrue(args.amber_enable)
         self.assertAlmostEqual(args.amber_weight, 0.25)
+        self.assertAlmostEqual(refine_spa.resolve_amber_weight(args), 0.25)
         self.assertEqual(args.amber_nonbonded, "CutoffNonPeriodic")
         self.assertEqual(args.amber_platform, "CPU")
         self.assertAlmostEqual(args.amber_hessian_diag, 7.5)
@@ -119,6 +125,14 @@ class TestAmberPhase1(unittest.TestCase):
         refine_spa.check_amber_args(refine_spa.parse_args(base[:-1] + ["--hydrogen", "no"]))
         with self.assertRaises(SystemExit):  # PME is no longer a valid choice
             refine_spa.parse_args(base + ["--amber_nonbonded", "PME"])
+        # the replacement ratio must be a fraction, and it is incompatible with the automatic weight
+        for extra in (["--amber_replace_geom", "1.5"], ["--amber_replace_geom", "-0.1"],
+                      ["--amber_weight_auto", "0.3"], ["--unrestrained"]):
+            with self.assertRaises(SystemExit, msg=str(extra)):
+                refine_spa.check_amber_args(refine_spa.parse_args(base + extra))
+        # with the ratio at 0 the automatic weight is allowed again
+        refine_spa.check_amber_args(refine_spa.parse_args(base + ["--amber_replace_geom", "0",
+                                                                  "--amber_weight_auto", "0.3"]))
         # off-diagonal Hessian needs the bonded mode
         refine_spa.check_amber_args(refine_spa.parse_args(base + ["--amber_hessian_offdiag"]))
         with self.assertRaises(SystemExit):
@@ -449,6 +463,68 @@ class TestAmberPhase1(unittest.TestCase):
                 pp[i, ax] += h; pm[i, ax] -= h
                 fd = (energy(pp) - 2 * energy(pos) + energy(pm)) / h**2
                 self.assertAlmostEqual(est[i, ax], fd, delta=max(1.0, 1e-3 * abs(fd)))
+
+    def test_replace_geom_restraints(self):
+        """The per-atom geometry weight is scaled for the atoms the force field covers, and atoms
+        outside it keep their classical restraints."""
+        try:
+            import openmm  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenMM is not installed")
+        if "CLIBD_MON" not in os.environ:
+            self.skipTest("CLIBD_MON is not set")
+        st = utils.fileio.read_structure("tests/1l2h/1l2h.cif.gz")   # has alternative conformers
+        self._remove_waters(st)
+        self._renumber_serials(st)
+        monlib = utils.restraints.load_monomer_library(st)
+        utils.restraints.add_hydrogens(st, monlib, "nucl")
+        self._renumber_serials(st)
+        rp = RefineParams(st, refine_xyz=True, adp_mode=0, refine_occ=False, refine_dfrac=False, cfg=None)
+        prior = AmberFFPrior(st, rp, platform_name="Reference", his_state="HIE")
+        self.assertGreater(prior.n_excluded_atoms, 0)
+        w = rp.geom_weights
+        numpy.testing.assert_allclose(numpy.asarray(w), 1., rtol=0, atol=1e-6)
+        self.assertIsNone(prior.geom_weights_full)
+        n = prior.replace_geom_restraints(1.0)
+        self.assertEqual(n, prior.n_ff_atoms)
+        self.assertIsNotNone(prior.geom_weights_full)
+        w = numpy.asarray(rp.geom_weights)
+        ff_serials = numpy.array([a.serial for a in prior._ff_atoms]) - 1
+        numpy.testing.assert_allclose(w[ff_serials], 0., atol=1e-7)
+        excluded = numpy.setdiff1d(numpy.arange(len(w)), ff_serials)
+        self.assertEqual(len(excluded), prior.n_excluded_atoms)
+        numpy.testing.assert_allclose(w[excluded], 1., atol=1e-7)   # keep full restraints
+        # a partial ratio scales instead of removing, and multiplies rather than overwriting
+        rp2 = RefineParams(st, refine_xyz=True, adp_mode=0, refine_occ=False, refine_dfrac=False, cfg=None)
+        numpy.asarray(rp2.geom_weights)[:] = 0.5
+        prior2 = AmberFFPrior(st, rp2, platform_name="Reference", his_state="HIE")
+        prior2.replace_geom_restraints(0.4)
+        w2 = numpy.asarray(rp2.geom_weights)
+        numpy.testing.assert_allclose(w2[ff_serials], 0.5 * 0.6, rtol=1e-6)
+        numpy.testing.assert_allclose(w2[excluded], 0.5, rtol=1e-6)
+        for bad in (-0.1, 1.1):
+            with self.assertRaises(RuntimeError):
+                prior2.replace_geom_restraints(bad)
+        self.assertEqual(prior2.replace_geom_restraints(0.), 0)   # a no-op
+
+    def test_model_stats_restores_weights(self):
+        """The statistics pass must report the classical geometry even when the restraints carry no
+        weight in the target, and must leave the target weights untouched."""
+        if "CLIBD_MON" not in os.environ:
+            self.skipTest("CLIBD_MON is not set")
+        from servalcat.refine.refine import Refine
+        st, rp, geom, cfg = self._geom_setup(shake=0.3)
+        prior = FakePrior(rp)
+        full = numpy.array(rp.geom_weights, copy=True)
+        numpy.asarray(rp.geom_weights)[:] = 0.
+        ref = Refine(st, geom, cfg, rp, ll=None, ff_prior=prior, ff_weight=1.,
+                     geom_weights_full=full)
+        stats = ref.model_stats(show_outliers=False)
+        self.assertIn("Bond distances, non H", stats["summary"]["r.m.s.Z"])
+        numpy.testing.assert_allclose(numpy.asarray(rp.geom_weights), 0., atol=1e-7)
+        # without the backup the zero-weight restraints drop out of the report
+        ref2 = Refine(st, geom, cfg, rp, ll=None, ff_prior=prior, ff_weight=1.)
+        self.assertNotIn("Bond distances, non H", ref2.model_stats(show_outliers=False)["summary"]["r.m.s.Z"])
 
     def test_his_state_excludes_protons(self):
         try:

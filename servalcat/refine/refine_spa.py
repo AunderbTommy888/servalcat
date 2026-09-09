@@ -133,8 +133,15 @@ def add_arguments(parser):
                         help="Write all output from cycles")
     parser.add_argument("--amber_enable", action="store_true",
                         help="Enable AMBER force-field prior (Phase 1: xyz only)")
-    parser.add_argument("--amber_weight", type=float, default=0.1,
-                        help="Weight for AMBER force-field prior (default: %(default)f)")
+    parser.add_argument("--amber_weight", type=float, default=None,
+                        help="Weight for the AMBER force-field term (default: 1.0 when it replaces the "
+                             "classical geometry restraints, 0.1 when it is added on top of them)")
+    parser.add_argument("--amber_replace_geom", type=float, default=1.0, metavar="RATIO",
+                        help="Fraction of Servalcat's classical geometry restraints that the force field "
+                             "replaces, for the atoms it covers: 1 = full replacement (default), 0 = keep them "
+                             "and use AMBER as an additional term. Atoms outside the force field keep their "
+                             "restraints. Chirality, NCS/stacking and symmetry-copy VDW repulsion have no AMBER "
+                             "equivalent and are scaled by the same factor (default: %(default)f)")
     parser.add_argument("--amber_weight_auto", type=float, nargs="?", const=0.3, default=None, metavar="RATIO",
                         help="Determine the AMBER weight automatically at the first cycle so that the force-field "
                              "gradient norm over xyz parameters equals RATIO times the geometry restraint gradient norm "
@@ -197,12 +204,32 @@ def parse_args(arg_list):
     return parser.parse_args(arg_list)
 # parse_args()
 
+def resolve_amber_weight(args):
+    """Default weight of the force-field term: it carries the chemistry when it replaces the classical
+    restraints, so 1.0 there; it is a small additional term otherwise."""
+    if args.amber_weight is not None:
+        return args.amber_weight
+    return 1.0 if args.amber_replace_geom > 0 else 0.1
+
+
 def check_amber_args(args):
     """Fail early with a clear message when --amber_enable is combined with unsupported options."""
     if not getattr(args, "amber_enable", False):
         if args.amber_minimizer != "gn" or args.amber_hessian_offdiag:
             raise SystemExit("Error: --amber_minimizer / --amber_hessian_offdiag require --amber_enable")
         return
+    if not 0. <= args.amber_replace_geom <= 1.:
+        raise SystemExit("Error: --amber_replace_geom must be within [0, 1] (got {})".format(args.amber_replace_geom))
+    if args.amber_replace_geom > 0 and args.amber_weight_auto is not None:
+        raise SystemExit("Error: --amber_weight_auto cannot be used with --amber_replace_geom > 0: the weight is "
+                         "determined from the ratio to the geometry restraint gradient, which is what the force "
+                         "field is replacing. Use --amber_weight, or --amber_replace_geom 0 to add the force "
+                         "field on top of the restraints")
+    if args.amber_replace_geom > 0 and getattr(args, "ncsr", False):
+        logger.writeln("WARNING: --ncsr is requested but --amber_replace_geom {} scales the NCS restraints down "
+                       "by the same factor for atoms covered by the force field".format(args.amber_replace_geom))
+    if args.amber_replace_geom > 0 and getattr(args, "unrestrained", False):
+        raise SystemExit("Error: --amber_replace_geom > 0 is meaningless with --unrestrained")
     if args.hydrogen != "all":
         raise SystemExit("Error: --amber_enable requires --hydrogen all (OpenMM residue templates need a complete "
                          "set of hydrogen atoms; got --hydrogen {})".format(args.hydrogen))
@@ -387,16 +414,19 @@ def main(args):
                                 ligand_ff=args.amber_ligand_ff,
                                 ligand_charge=args.amber_ligand_charge,
                                 ligand_smiles=ff_ligand.parse_smiles_overrides(args.amber_ligand_smiles))
+        if args.amber_replace_geom > 0:
+            ff_prior.replace_geom_restraints(args.amber_replace_geom)
     refiner = Refine(st, geom, refine_cfg, refine_params, ll,
                      unrestrained=args.unrestrained,
                      ff_prior=ff_prior,
-                     ff_weight=args.amber_weight,
+                     ff_weight=resolve_amber_weight(args),
                      ff_weight_auto=args.amber_weight_auto,
                      ff_offdiag=args.amber_hessian_offdiag,
                      minimizer=args.amber_minimizer,
                      lbfgs_maxiter=args.amber_lbfgs_maxiter,
                      ls_trials=args.amber_ls_trials,
-                     lm_damping=args.amber_lm_damping)
+                     lm_damping=args.amber_lm_damping,
+                     geom_weights_full=None if ff_prior is None else ff_prior.geom_weights_full)
 
     geom.geom.adpr_max_dist = args.max_dist_for_adp_restraint
     if args.adp_restraint_power is not None: geom.geom.adpr_d_power = args.adp_restraint_power

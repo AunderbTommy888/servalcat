@@ -18,7 +18,8 @@
      非対角成分の計算方法と正定値性 (8 節)。
 
 5. `amber_weight_study_note_ja.md`
-   - 対角 Hessian・水素位置・重み走査・クロスバリデーション・自動重みの検討を図とともにまとめたノート。
+   - 対角 Hessian・水素位置・重み走査・クロスバリデーション・自動重み・最適化器 3 版の検討を図とともにまとめたノート。
+   - 8 節は古典的幾何拘束を力場で置き換えた版 (既定の挙動) での同じ実験。
    - 図は `figures/`、作図は `examples/plot_amber_weight_study.py`。
 
 6. `examples/run_7db6_amber_openff.sh`

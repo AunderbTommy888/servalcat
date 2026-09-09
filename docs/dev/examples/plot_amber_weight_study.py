@@ -211,6 +211,57 @@ end_labels(ax, 5.12, labels, min_gap=0.32, fontsize=7.5)
 ax.set_xticks(range(6)); ax.set_xlim(-0.2, 8.8); ax.set_ylim(-9.0, -4.0)
 style(ax, "7dy0: stable variants (zoom)", "cycle", "E_AMBER (10^3 kJ/mol)")
 fig.tight_layout(w_pad=2); fig.savefig(os.path.join(FIG, "fig_7dy0_hessian_study.png"), dpi=160); plt.close(fig)
+# ================= Fig 5: replacement-version weight scan =================
+def scan_rep(dirname):
+    rows = []
+    for d in sorted(glob.glob(os.path.join(WORK, dirname, "w*")), key=lambda p: float(os.path.basename(p)[1:])):
+        w = float(os.path.basename(d)[1:])
+        log = os.path.join(d, "refined.log")
+        st = json.load(open(os.path.join(d, "refined_stats.json")))
+        z = st[-1]["geom"]["summary"]["r.m.s.Z"]
+        rows.append({"w": w, "fsc": fsc(log), "ff": accepted_ff(log),
+                     "bond": z.get("Bond distances, non H", numpy.nan),
+                     "angle": z.get("Bond angles, non H", numpy.nan),
+                     "chir": next((v for k, v in z.items() if k.lower().startswith("chir")), numpy.nan)})
+    return rows
+
+if os.path.isdir(os.path.join(WORK, "7db6_weight_scan_replace")):
+    rep = scan_rep("7db6_weight_scan_replace")
+    repcv = scan_rep("7db6_weight_scan_replace_cv")
+    data["scan_replace"] = rep
+    data["scan_replace_cv"] = repcv
+    json.dump(data, open(os.path.join(FIG, "amber_weight_study_data.json"), "w"), indent=1, ensure_ascii=False)
+    ws = [r["w"] for r in rep]
+    cvw = [r["w"] for r in repcv]
+    fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.7))
+    ax = axes[0]
+    ax.plot(range(len(ws)), [r["fsc"]["full"] for r in rep], color=CAT[0], marker="o",
+            markeredgecolor=SURFACE, markeredgewidth=1.5, label="FSC(full)")
+    pos = {w: i for i, w in enumerate(ws)}
+    xs = [pos[r["w"]] for r in repcv if r["w"] in pos]
+    ax.plot(xs, [r["fsc"]["half2"] for r in repcv if r["w"] in pos], color=CAT[1], marker="D",
+            markeredgecolor=SURFACE, markeredgewidth=1.5, label="free FSC(half2)")
+    ax.legend(loc="upper right", fontsize=8)
+    style(ax, "Full replacement: FSC vs w_ff", "w_ff", "FSCaverage"); weight_axis(ax, ws)
+    ax = axes[1]
+    ax.plot(range(len(ws)), [r["ff"][1]/1000 if len(r["ff"]) > 1 else numpy.nan for r in rep], color=CAT[0],
+            marker="o", markeredgecolor=SURFACE, markeredgewidth=1.5, label="after cycle 1")
+    ax.plot(range(len(ws)), [r["ff"][-1]/1000 if r["ff"] else numpy.nan for r in rep], color=CAT[1],
+            marker="o", markeredgecolor=SURFACE, markeredgewidth=1.5, label="after cycle 5")
+    ax.legend(loc="lower left", fontsize=8)
+    style(ax, "Full replacement: E_AMBER vs w_ff", "w_ff", "E_AMBER (10^3 kJ/mol)"); weight_axis(ax, ws)
+    ax = axes[2]
+    for i, (k, lab) in enumerate((("bond", "bond"), ("angle", "angle"), ("chir", "chirality"))):
+        yy = [r[k] for r in rep]
+        ax.plot(range(len(ws)), yy, color=CAT[i], marker="o", markeredgecolor=SURFACE, markeredgewidth=1.5, label=lab)
+    ax.axhspan(0.4, 1.4, color=CAT[0], alpha=0.08, zorder=0)
+    ax.text(len(ws)-1.05, 1.45, "AMBER vs dictionary\nintrinsic offset", fontsize=7, color=MUTED, ha="right", va="bottom")
+    ax.legend(loc="upper right", fontsize=8)
+    style(ax, "Full replacement: rmsZ vs dictionary", "w_ff", "r.m.s. Z after cycle 5"); weight_axis(ax, ws)
+    fig.tight_layout(w_pad=2)
+    fig.savefig(os.path.join(FIG, "fig_7db6_weight_scan_replace.png"), dpi=160); plt.close(fig)
+    print("  replacement scan figure written")
+
 print("figures written to", FIG)
 for k, v in dy0.items(): print("  7dy0", k, "->", ["%.0f" % x for x in v["ff"]], v["fsc"].get("full"))
 print("  auto full w=%.4f fsc=%s ff=%s" % (auto["full"]["w"], auto["full"]["fsc"], ["%.0f" % x for x in auto["full"]["ff"]]))

@@ -45,7 +45,8 @@ printf "%s\n" 0 "${WEIGHTS[@]}" | xargs -P "$PAR" -I{} bash -c 'run_one {}'
 "$PY" - "$OUTDIR" 0 "${WEIGHTS[@]}" <<'PYEOF'
 import sys, os, json, re, servalcat, gemmi, numpy
 outdir, weights = sys.argv[1], sys.argv[2:]
-print("%6s %9s %11s %11s %9s %9s %9s %s" % ("w_ff", "FSC(full)", "E_ff cyc1", "E_ff last", "bondZ", "angleZ", "vdwZ", "fval decreased"))
+print("%6s %6s %8s %9s %11s %11s %8s %8s %8s %8s %s" % (
+    "w", "w_ff", "replace", "FSC(full)", "E_ff cyc1", "E_ff last", "bondZ", "angleZ", "vdwZ", "chirZ", "fval dec / extra"))
 for w in weights:
     d = os.path.join(outdir, "w" + w)
     log = open(os.path.join(d, "refined.log")).read()
@@ -63,5 +64,13 @@ for w in weights:
     dec = [c.get("fval_decreased") for c in stats[1:]]
     e1 = ff[1] if len(ff) > 1 else float("nan"); el = ff[-1] if ff else float("nan")
     extra = " ".join("%s=%.4f" % kv for kv in sorted(other.items()))
-    print("%6s %9.4f %11.0f %11.0f %9.3f %9.3f %9.3f %s %s" % (w, fsc[-1], e1, el, bz, az, vz, "".join("T" if x else "F" for x in dec), extra))
+    chir = next((v for k, v in g["r.m.s.Z"].items() if k.lower().startswith("chir")), float("nan"))
+    wff = stats[1].get("ff_weight")
+    m = re.search(r"geometry restraints scaled by ([\d.eE+-]+) for", log)
+    rep = "%.3g" % (1. - float(m.group(1))) if m else ("-" if w == "0" else "0")
+    nan = float("nan")
+    print("%6s %6s %8s %9.4f %11.0f %11.0f %8.3f %8.3f %8.3f %8.3f %s %s" % (
+        w, "%.3g" % wff if wff else "-", rep, fsc[-1], e1, el,
+        bz if bz is not None else nan, az if az is not None else nan, vz, chir,
+        "".join("T" if x else "F" for x in dec), extra))
 PYEOF

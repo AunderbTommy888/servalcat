@@ -255,6 +255,7 @@ class AmberFFPrior:
         self.ligand_smiles = dict(ligand_smiles or {})
         self.ligand_info = []
         self.n_disulfides = 0
+        self.geom_weights_full = None  # per-atom geometry weights before replace_geom_restraints()
         self.refine_params = refine_params
         self.hessian_diag = float(hessian_diag)  # constant value (const) or floor (bonded), kJ/mol/A^2
         if self.hessian_diag < 0:
@@ -520,6 +521,52 @@ class AmberFFPrior:
             logger.writeln("AMBER prior: WARNING: {} angle(s) within {:.1f} deg of linear; the 1/sin(theta) "
                            "factor of the Hessian estimate is clamped there".format(
                                n, numpy.degrees(numpy.arcsin(MIN_SIN_ANGLE))))
+
+    def replace_geom_restraints(self, ratio):
+        """Hand the classical geometry restraints over to the force field.
+
+        Servalcat weights every restraint by the mean of the per-atom weights of the atoms it
+        involves (RefineParams::find_geom_weight), so multiplying the per-atom weight of the atoms
+        this force field covers by (1 - ratio) scales those restraints down:
+        ratio = 1 removes them entirely and AMBER alone provides the chemistry, ratio = 0 leaves
+        them as they are and AMBER is an additional term.
+
+        Atoms outside the force field keep their full classical restraints - alternative conformers
+        past the first, and histidine protons dropped for HIE/HID. A restraint that spans both kinds
+        of atom keeps the average of the two weights, which is what makes this graceful.
+
+        Not covered by AMBER, and therefore lost in proportion to ratio (the per-atom weight applies
+        to every restraint type):
+        - chirality: AMBER has no explicit sp3 chirality term (its impropers only keep sp2 planarity)
+        - NCS and stacking restraints
+        - VDW repulsion against symmetry and NCS copies: OpenMM only ever sees the asymmetric unit
+        ADP, occupancy, jelly-body and external restraints are unaffected (they do not go through
+        the per-atom geometry weight).
+
+        Returns the number of atoms whose weight was scaled.
+        """
+        if not 0. <= ratio <= 1.:
+            raise RuntimeError("geometry replacement ratio must be within [0, 1] (got {})".format(ratio))
+        if ratio == 0.:
+            return 0
+        w = self.refine_params.geom_weights  # per-atom view, indexed by atom.serial - 1
+        # keep the original weights: zero-weight restraints drop out of the geometry report, so the
+        # reporting pass restores them to keep bond/angle rmsZ available as a diagnostic
+        self.geom_weights_full = numpy.array(w, copy=True)
+        serials = numpy.array([a.serial for a in self._ff_atoms], dtype=int) - 1
+        if serials.size and (serials.min() < 0 or serials.max() >= len(w)):
+            raise RuntimeError("atom serials are out of range for the geometry weight vector; "
+                               "they must be renumbered 1..N before replace_geom_restraints()")
+        w[serials] *= (1. - ratio)  # multiply, so a local_geom_weights setting is not discarded
+        logger.writeln("AMBER prior: classical geometry restraints scaled by {:.3g} for {} atom(s) "
+                       "covered by the force field{}".format(
+                           1. - ratio, serials.size,
+                           "; {} atom(s) outside it keep full restraints".format(self.n_excluded_atoms)
+                           if self.n_excluded_atoms else ""))
+        if ratio > 0.:
+            logger.writeln("AMBER prior: NOTE: chirality, NCS/stacking restraints and VDW repulsion against "
+                           "symmetry copies are scaled by the same factor and have no AMBER equivalent")
+        return int(serials.size)
 
     def calc_target_and_grad(self, target_only=False):
         self._context.setPositions(self._positions_nm())

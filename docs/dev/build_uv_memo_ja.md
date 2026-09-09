@@ -286,7 +286,7 @@ CLIBD_MON="$PWD/third_party/monomers" PATH="$PWD/.venv-openff/bin:$PATH" \
 | `test_xtal.py` | 5 件 OK (1 件 skip: `refmac unavailable`) |
 | `test_spa.py` | 9 件 OK (1 件 skip: `refmac unavailable`) |
 | `test_refine.py` | 11 件 OK (約 100 秒) |
-| `test_amber_phase1.py` | 20 件 (メイン venv では OpenFF 依存 2 件 skip、OpenFF 環境では全件 OK) |
+| `test_amber_phase1.py` | 22 件 (メイン venv では OpenFF 依存 2 件 skip、OpenFF 環境では全件 OK) |
 
 skip される 2 件は REFMAC5 が PATH に無いためで、CCP4 未導入環境では期待通りの挙動。
 
@@ -377,6 +377,35 @@ EXTRA_ARGS="--cross_validation" bash docs/dev/examples/scan_amber_weight_7db6.sh
 
 結果ファイルは `work/7db6_weight_scan/w*/` と `work/7db6_weight_scan_cv/w*/` (各 `refined.log`, `refined_stats.json`,
 `refined.mmcif`, マップ)。
+
+## 幾何拘束の置き換え (既定の挙動)
+
+`--amber_enable` を付けると、既定で Servalcat の古典的幾何拘束を AMBER + OpenFF で置き換える
+(`--amber_replace_geom 1.0`)。従来のように力場を上乗せしたい場合は `--amber_replace_geom 0` を指定する。
+
+```bash
+cd "$PROJECT_ROOT"
+# 既定: 完全置き換え (w_ff の既定も 1.0 になる)
+.venv-openff/bin/python -m servalcat refine_spa_norefmac ... --amber_enable
+# 10% だけ古典的拘束を残す (カイラリティの保険)
+.venv-openff/bin/python -m servalcat refine_spa_norefmac ... --amber_enable --amber_replace_geom 0.9
+# 従来どおり上乗せ (自動重みが使える)
+.venv-openff/bin/python -m servalcat refine_spa_norefmac ... --amber_enable --amber_replace_geom 0 --amber_weight_auto
+```
+
+注意:
+
+- 置き換えると `geom_x` はほぼ 0 になる (7dy0 で 51,884 → 0.26)。ADP 拘束の `geom_a` は残る。
+- **辞書基準の bond/angle rmsZ は意味が変わる**。AMBER の平衡値は monomer library の理想値から
+  重原子間で rms 0.0086 Å (|z| 中央値 0.40、p90 1.40) ずれているので、置き換え後の bondZ 1.0〜1.6 は
+  「悪い幾何」ではなく「AMBER と辞書の差」を測っている。判断は E_AMBER の推移と併せて行う。
+- カイラリティ、NCS/スタッキング拘束、対称コピーに対する VDW 反発は AMBER に対応物が無く、
+  比率どおりに弱まる。7db6 でカイラリティ rmsZ が 0.55 → 0.84 に悪化した。
+- 力場外の原子 (第 2 以降の altloc、HIE/HID で外した His プロトン、microheterogeneity の後続残基) は
+  古典的拘束を保持する。ログに「N atom(s) outside it keep full restraints」と出る。
+- `--amber_weight_auto` は置き換え時には使えない (幾何拘束の勾配を基準にする指標なので)。
+- 統計は置き換え前の重みで計算し直すので、bond rmsZ は引き続き表示され自動重み調整も働く。
+- 結果ファイルは `work/replace_geom_study/`。詳細は `amber_refine_phase1_design_ja.md` の Phase 3 節。
 
 ## 最適化器の 2 バージョン
 
