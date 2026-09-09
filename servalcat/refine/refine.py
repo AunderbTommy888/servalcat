@@ -746,7 +746,7 @@ class GroupOccupancy:
 
 class Refine:
     def __init__(self, st, geom, cfg, refine_params, ll=None, unrestrained=False,
-                 ff_prior=None, ff_weight=0.):
+                 ff_prior=None, ff_weight=0., ff_weight_auto=None):
         assert geom is not None
         self.st = st # clone()?
         self.st_traj = None
@@ -755,6 +755,8 @@ class Refine:
         self.ll = ll
         self.ff_prior = ff_prior
         self.ff_weight = ff_weight
+        self.ff_weight_auto = ff_weight_auto  # target ratio |w_ff g_ff| / |g_geom| over xyz params; None = fixed weight
+        self.ff_weight_determined = ff_weight_auto is None
         self.ff_grad = None
         self.ff_target = 0.
         self.gamma = 0
@@ -788,7 +790,10 @@ class Refine:
             logger.writeln("  weight: {}".format(self.geom.occr_w))
         if self.ff_prior is not None:
             logger.writeln(" AMBER force-field prior")
-            logger.writeln("  weight: {}".format(self.ff_weight))
+            if self.ff_weight_auto is not None:
+                logger.writeln("  weight: auto (|w_ff g_ff| / |g_geom| = {} at the first cycle)".format(self.ff_weight_auto))
+            else:
+                logger.writeln("  weight: {}".format(self.ff_weight))
             logger.writeln("  hessian_mode: {}".format(self.ff_prior.hessian_mode))
             logger.writeln("  hessian_diag ({}): {}".format("floor" if self.ff_prior.hessian_mode == "bonded" else "const",
                                                             self.ff_prior.hessian_diag))
@@ -897,10 +902,29 @@ class Refine:
         if self.ff_prior is not None:
             ff, self.ff_grad = self.ff_prior.calc_target_and_grad(target_only=target_only)
             logger.writeln(" ff= {}".format(ff))
+            if not target_only and not self.ff_weight_determined:
+                self.determine_ff_weight(w)
         self.ff_target = ff
 
         f =  w * ll + geom + self.ff_weight * ff
         return f
+
+    def determine_ff_weight(self, w):
+        """Set ff_weight so that the force-field gradient norm over xyz parameters is
+        ff_weight_auto times the geometry restraint gradient norm (first call only)."""
+        sel = self.params.vec_selection(Type.X)
+        g_geom = numpy.array(self.geom.geom.target.vn)[sel]
+        g_ff = self.ff_grad[sel]
+        n_geom, n_ff = numpy.linalg.norm(g_geom), numpy.linalg.norm(g_ff)
+        n_ll = numpy.linalg.norm(w * numpy.array(self.ll.ll.vn)[sel]) if self.ll is not None else 0.
+        if n_ff <= 0:
+            logger.writeln("WARNING: force-field gradient is zero; keeping ff_weight = {}".format(self.ff_weight))
+        else:
+            self.ff_weight = float(self.ff_weight_auto * n_geom / n_ff)
+        self.ff_weight_determined = True
+        logger.writeln(" gradient norms over xyz: |g_geom|= {:.4e} |w g_exp|= {:.4e} |g_ff|= {:.4e}".format(n_geom, n_ll, n_ff))
+        logger.writeln(" ff_weight determined automatically: {:.4g} (|w_ff g_ff|/|g_geom| = {})".format(
+            self.ff_weight, self.ff_weight_auto))
 
     #@profile
     def run_cycle(self, weight=1):
@@ -1030,6 +1054,9 @@ class Refine:
                 is_ok, shift_scale, fval = self.run_cycle(weight=weight)
                 stats.append({"Ncyc": len(stats), "shift_scale": shift_scale, "fval": fval, "fval_decreased": is_ok,
                               "weight": weight})
+                if self.ff_prior is not None:
+                    stats[-1]["ff"] = self.ff_target
+                    stats[-1]["ff_weight"] = self.ff_weight
             elif occ_refine_flag:
                 stats.append({"Ncyc": len(stats)})
             if occ_refine_flag:

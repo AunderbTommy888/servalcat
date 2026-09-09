@@ -19,6 +19,7 @@ import numpy
 import gemmi
 from servalcat import ext
 from servalcat.utils import logger
+from servalcat.refine import ff_ligand
 
 HIS_STATES = ("HIP", "HIE", "HID")
 HESSIAN_MODES = ("bonded", "const")
@@ -146,8 +147,18 @@ class AmberFFPrior:
                  platform_name="Reference",
                  hessian_diag=1000.,
                  hessian_mode="bonded",
-                 his_state="HIP"):
+                 his_state="HIP",
+                 monlib=None,
+                 ligand_ff=ff_ligand.DEFAULT_LIGAND_FF,
+                 ligand_charge=ff_ligand.DEFAULT_CHARGE_METHOD,
+                 ligand_smiles=None):
         self.st = st
+        self.monlib = monlib
+        self.ligand_ff = ligand_ff
+        self.ligand_charge = ligand_charge
+        self.ligand_smiles = dict(ligand_smiles or {})
+        self.ligand_info = []
+        self.n_disulfides = 0
         self.refine_params = refine_params
         self.hessian_diag = float(hessian_diag)  # constant value (const) or floor (bonded), kJ/mol/A^2
         if hessian_mode not in HESSIAN_MODES:
@@ -242,22 +253,46 @@ class AmberFFPrior:
             pdb = app.PDBFile(pdb_path)
             # The unit cell of an SPA model is the map box; never let it act as a periodic cell.
             pdb.topology.setPeriodicBoxVectors(None)
+            # Disulfide-bonded cysteines (SG-SG bonds are created by PDBFile from distances): with
+            # ignoreExternalBonds=True a CYS without HG matches both CYM and CYX, so pin them to CYX.
+            residue_templates = {}
+            for a1, a2 in pdb.topology.bonds():
+                if (a1.residue is not a2.residue and a1.name == "SG" and a2.name == "SG"
+                        and a1.residue.name == "CYS" and a2.residue.name == "CYS"):
+                    residue_templates[a1.residue] = "CYX"
+                    residue_templates[a2.residue] = "CYX"
+            self.n_disulfides = len(residue_templates) // 2
+            if self.n_disulfides:
+                logger.writeln("AMBER prior: {} disulfide bond(s) -> CYX templates".format(self.n_disulfides))
 
             ff = app.ForceField(*self.forcefield_files)
             if not hasattr(app, self.nonbonded_method):
                 raise RuntimeError("Unknown OpenMM nonbonded method: {}".format(self.nonbonded_method))
             nb_method = getattr(app, self.nonbonded_method)
+            if self.ligand_ff and str(self.ligand_ff).lower() != "none":
+                if ff_ligand.find_ligand_residues(ff, pdb.topology):
+                    if self.monlib is None:
+                        raise RuntimeError("residues without AMBER templates found but no monomer library was given "
+                                           "to AmberFFPrior (needed for ligand force-field assignment)")
+                    self.ligand_info = ff_ligand.register_ligand_templates(
+                        ff, pdb.topology, self.monlib, ligand_ff=self.ligand_ff,
+                        charge_method=self.ligand_charge, smiles_overrides=self.ligand_smiles)
+                    for name, n, q, lff in self.ligand_info:
+                        logger.writeln("AMBER prior: {} parameterised with {} ({} atoms, formal charge {:+d}, {} charges)".format(
+                            name, lff, n, q, self.ligand_charge))
             try:
                 system = ff.createSystem(pdb.topology,
                                          nonbondedMethod=nb_method,
                                          constraints=None,
                                          rigidWater=False,
+                                         residueTemplates=residue_templates,
                                          ignoreExternalBonds=True)
             except Exception as e:
                 raise RuntimeError(
                     "OpenMM failed to build an AMBER system. "
                     "This usually means the model contains residues without force-field templates "
-                    "(e.g. ligands) and needs additional parameter XML files.\n"
+                    "(e.g. ligands); enable ligand parameterisation with --amber_ligand_ff (needs rdkit, "
+                    "openff-toolkit and openmmforcefields) or supply parameter XML files via --amber_forcefield.\n"
                     "Original error: {}".format(e)
                 ) from e
 

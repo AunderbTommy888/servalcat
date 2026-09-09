@@ -145,3 +145,6 @@ dmypy.json
 
 # Local external data (monomer library etc.)
 third_party/
+.venv-openff/
+tools/
+work/

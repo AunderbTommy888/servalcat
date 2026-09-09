@@ -213,7 +213,95 @@ His に付けると静電項の歪みがそのまま勾配に乗る。総電荷�
 修正後は 5 サイクルとも「function not minimised」が出ず、総目的関数が単調に減少した。
 修正前の FSC が僅かに高いのは、水素の破綻と引き換えに重原子の自由度が増えているためで、比較の意味は薄い。
 
-## 6. 検証コマンド
+## 6. リガンドの化学情報と力場割り当て (Phase 2)
+
+### 6.1 方針
+
+リガンドの結合次数・形式電荷・水素は、Servalcat が拘束にも使っている monomer library (AceDRG 生成) の
+辞書からとる。辞書は Kekulé 形式の結合次数 (`single`/`double`/`triple`、aromatic フラグ) と明示的な形式電荷
+を持つので、そのまま RDKit の分子にできる (BTN: O12 が −1、SO4: O3/O4 が −1、SPK: 4 つの N が +1)。
+これにより、モデルの水素集合 (辞書から生成) と力場側の分子が原子単位で一致する。
+
+### 6.2 変換
+
+```
+ChemComp (gemmi) --元素・形式電荷・結合次数--> RDKit Mol --SanitizeMol--> OpenFF Molecule
+                                                              |
+                        Deloc/Unspec を含む場合: 連結性 + 総電荷 -> rdDetermineBonds
+```
+
+- RDKit の `SanitizeMol` で芳香族性・原子価を検証する。失敗時は連結性と総電荷だけから結合次数を再導出し、
+  それでも失敗なら `--amber_ligand_smiles NAME=SMILES` を促すエラーにする。
+- 辞書座標があれば `AssignStereochemistryFrom3D` で立体を決める (OpenFF は未定義立体を許容する設定)。
+
+### 6.3 トポロジ照合
+
+OpenMM の `PDBFile` は標準残基の結合しか作らない。リガンドの残基内結合を辞書から `Topology.addBond()` で
+追加したうえで、openmmforcefields のテンプレート生成器に `Molecule` を登録する。生成器は残基グラフ
+(元素 + 連結性) と `Molecule` の同型判定で照合し、結合次数と電荷は `Molecule` 側から取る。
+したがって原子名の一致は不要だが、原子集合 (特に水素数) の一致は必須。
+
+### 6.4 部分電荷
+
+| 方法 | 実体 | 備考 |
+|---|---|---|
+| `nagl` (既定) | openff-nagl の GNN (`openff-gnn-am1bcc-1.0.0`) | AM1-BCC の学習モデル。BTN で約 10 秒。外部プログラム不要 |
+| `am1bcc` | AmberTools `sqm` | 参照実装だが遅い (BTN で約 25 秒)。`sqm` が PATH に必要 |
+| `gasteiger` | RDKit | 粗い。テスト用 |
+
+openmmforcefields は `Molecule.partial_charges` が非ゼロなら「ユーザー電荷」として使い、全て 0 の場合は
+自分で AM1-BCC を計算しに行く。そのため「電荷 0」という選択肢は提供しない。
+
+1stp の BTN では nagl と am1bcc の電荷は概ね一致した (C11: 0.913 vs 0.903、O11/O12: −0.845 vs −0.856)。
+
+### 6.5 ジスルフィド結合の扱い
+
+Servalcat は SS リンクを検出した CYS から HG を除いて水素を生成する。OpenMM 側では、その CYS が
+`ignoreExternalBonds=True` のもとで CYM (チオラート、−1) と CYX (ジスルフィド) の両方に一致して曖昧になる。
+`PDBFile` が SG–SG 距離から作ったジスルフィド結合をトポロジから拾い、該当 CYS を `residueTemplates` で CYX に
+固定して解決した (7db6 で 4 本)。
+
+### 6.6 未対応
+
+- 共有結合で他残基とつながるリガンド・修飾残基。テンプレート生成器は孤立分子を前提にしており、
+  残基境界をまたぐ結合を持つ分子は同型照合できない。現状は明示的なエラー。
+  対応するには、結合相手をキャップした `Molecule` を作って残基テンプレートに変換する仕組みが必要。
+
+## 7. 重み $w_{ff}$ の決定
+
+走査・クロスバリデーション・自動重みの結果を図とともにまとめた議論は `amber_weight_study_note_ja.md` を参照。
+
+### 7.1 走査 (7db6)
+
+`docs/dev/examples/scan_amber_weight_7db6.sh` による走査では、$w_{ff} \le 0.1$ で $E_{AMBER}$ がサイクルごとに上昇
+(0.02 では 5 サイクル後に正の値)、0.2〜0.3 で横ばい、0.5 以上で減少に転じる。free FSC (half2) は $w_{ff}=0$ が最大で、
+0.2〜0.3 での低下は 0.012〜0.016、work − free の差は重みとともに縮む。表は `build_uv_memo_ja.md` を参照。
+
+### 7.2 勾配ノルム比による自動決定
+
+Gauss-Newton の 1 ステップは $\Delta x = -H^{-1} g$ で、$g = g_{geom} + w_{exp} g_{exp} + w_{ff} g_{ff}$。
+力場項の「効き」は $\lVert w_{ff} g_{ff} \rVert$ が他項に対してどの程度かで決まるので、
+
+$$
+w_{ff} = R \, \frac{\lVert g_{geom} \rVert_{xyz}}{\lVert g_{ff} \rVert_{xyz}}
+$$
+
+と置く (`Refine.determine_ff_weight()`)。ノルムは xyz パラメータ上で取り、1 サイクル目の勾配で一度だけ決める。
+基準を幾何拘束項にした理由:
+
+- 力場項は化学的な事前知識であり、幾何拘束と同じ役割。データ項を基準にすると高分解能でもデータと同比率で
+  競合し続けるが、幾何項基準なら高分解能ではデータ項が自然に支配する。
+- 幾何項の勾配ノルムはマップ品質に依存しないので、$R$ の意味が系間で比較しやすい。
+
+7db6 の 1 サイクル目は $\lVert g_{geom} \rVert = 1.03 \times 10^4$、$\lVert w_{exp} g_{exp} \rVert = 4.9 \times 10^3$、
+$\lVert g_{ff} \rVert = 1.19 \times 10^4$ で、走査の最適域 0.2〜0.3 は $R \approx 0.25$〜$0.35$ に対応する。既定値は
+$R = 0.3$ とした ($w_{ff} = 0.259$)。7dy0 では $\lVert g_{ff} \rVert / \lVert g_{geom} \rVert = 0.64$ と小さく、
+$w_{ff} = 0.471$ が選ばれ、$E_{AMBER}$ は 5 サイクルで単調に減少した。
+
+注意: $R$ は 1 系での校正値。分解能・系のサイズ・水素の割合で $\lVert g_{ff} \rVert$ の性質が変わるため、
+他系での妥当性は確認が必要。また $E_{AMBER}$ は kJ/mol、幾何項は無次元なので $w_{ff}$ 自体の値は系間で比較できない。
+
+## 8. 検証コマンド
 
 ```bash
 cd "$PROJECT_ROOT"
@@ -226,5 +314,9 @@ CLIBD_MON="$PWD/third_party/monomers" .venv/bin/python tests/test_amber_phase1.p
   厳密な Hessian 対角 (有限差分) と一致することを確認 (OpenMM 不要)。
 - `test_his_state_excludes_protons`: 1l2h で HIE/HID 指定時に HD1/HE2 の個数分だけ力場原子が減り、
   各状態で系が構築できることを確認。
+- `test_chemcomp_to_rdkit`: BTN/SO4/SPK の形式電荷と原子数、TRP の芳香族認識、部分原子集合 (rdkit のみ必要)。
+- `test_ligand_openff_prior_optional`: BTN 単体で OpenFF テンプレート生成、エネルギー・勾配・対角 Hessian (OpenFF 環境が必要)。
+- `test_determine_ff_weight`: 擬似 prior を使い、決定された重みが $\lVert w_{ff} g_{ff} \rVert / \lVert g_{geom} \rVert = R$ を満たし、
+  一度だけ決定されることを確認 (OpenMM 不要)。
 - `test_amber_prior_energy_grad_optional`: altloc 除外原子の勾配と対角が 0、力場原子の対角がフロア以上
   であること、`const` モードが従来挙動を再現することを確認。

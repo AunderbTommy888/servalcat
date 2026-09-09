@@ -80,6 +80,47 @@ cd "$PROJECT_ROOT"
 .venv/bin/python -c "import openmm; print(openmm.__version__)"
 ```
 
+## OpenFF 環境 (リガンド力場割り当て、任意)
+
+`--amber_ligand_ff` (既定 `openff-2.2.1`) でリガンドに力場を割り当てるには、rdkit / openff-toolkit /
+openmmforcefields が必要です。openff-toolkit は PyPI 上の配布が yank されているため pip では入らず、
+conda-forge から入れます。conda が無い環境では micromamba を使います (以下はこの環境で確認した手順)。
+
+```bash
+cd "$PROJECT_ROOT"
+# micromamba (単一バイナリ) を取得
+mkdir -p tools/bin
+curl -sL https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C tools bin/micromamba
+export MAMBA_ROOT_PREFIX="$PWD/tools/mamba_root"
+
+# OpenFF 一式 + OpenMM + AmberTools を含む環境を作る (数 GB、数分)
+tools/bin/micromamba create -y -p .venv-openff -c conda-forge \
+    python=3.12 "openmm>=8" openmmforcefields openff-toolkit ambertools rdkit \
+    openff-nagl openff-nagl-models pip cmake ninja
+
+# servalcat をこの環境にも editable install (C++ 拡張をビルドする)
+.venv-openff/bin/pip install -e . "gemmi==0.7.5"
+```
+
+確認:
+
+```bash
+cd "$PROJECT_ROOT"
+.venv-openff/bin/python -c "import servalcat, openmm, openmmforcefields, rdkit; from openff.toolkit import Molecule; print('ok')"
+CLIBD_MON="$PWD/third_party/monomers" PATH="$PWD/.venv-openff/bin:$PATH" .venv-openff/bin/python tests/test_amber_phase1.py
+```
+
+補足:
+
+- `.venv-openff/` と `tools/` は `.gitignore` に含めてある (`tools/` は追加が必要なら足す)。
+- AM1-BCC 電荷 (`--amber_ligand_charge am1bcc`) は AmberTools の `sqm` が PATH に必要。
+  `PATH="$PROJECT_ROOT/.venv-openff/bin:$PATH"` を付けるか、環境を activate して実行する。
+  既定の `nagl` (GNN による AM1-BCC 近似) は PATH 設定なしで動く。
+- メイン venv (`.venv`) には `uv pip install rdkit` だけ入れておくと、OpenFF 非依存のリガンド化学変換テスト
+  (`test_chemcomp_to_rdkit`) が走る。OpenFF 依存テストは skip される。
+- この環境 (2026-09-09) で入ったもの: openmm 8.6.0, openmmforcefields 0.16.0, openff-toolkit 0.19.0,
+  openff-nagl 0.5.5, ambertools 26.0, rdkit 2026.03.1。
+
 ## Monomer library (CLIBD_MON)
 
 以下のテスト・実行で CCP4 形式 monomer library が必要です。環境変数 `CLIBD_MON` で参照先を指定します。
@@ -226,6 +267,16 @@ CLIBD_MON="$PWD/third_party/monomers" bash -lc 'set -e; for f in tests/test_*.py
 - `tests/test_refine.py` は `tests/test_spa.py` を import し、7dy0 データのダウンロードを共有する。
   同時に別プロセスで走らせるとダウンロードが競合するので、並列化するなら先に `test_spa.py` を一度通しておく。
 
+実データ + リガンドのテスト (OpenFF 環境が必要、初回は 7db6 の半マップ約 18 MB をダウンロードして `tests/7db6/` に保存):
+
+```bash
+cd "$PROJECT_ROOT"
+CLIBD_MON="$PWD/third_party/monomers" PATH="$PWD/.venv-openff/bin:$PATH" \
+    .venv-openff/bin/python tests/test_amber_phase1.py TestAmberLigandRealData
+```
+
+メイン venv (`.venv`) で `tests/test_amber_phase1.py` を走らせた場合、OpenFF 依存の 2 件は skip される。
+
 ### この環境での確認結果 (2026-09-09)
 
 | テスト | 結果 |
@@ -235,9 +286,156 @@ CLIBD_MON="$PWD/third_party/monomers" bash -lc 'set -e; for f in tests/test_*.py
 | `test_xtal.py` | 5 件 OK (1 件 skip: `refmac unavailable`) |
 | `test_spa.py` | 9 件 OK (1 件 skip: `refmac unavailable`) |
 | `test_refine.py` | 11 件 OK (約 100 秒) |
-| `test_amber_phase1.py` | 5 件 OK |
+| `test_amber_phase1.py` | 13 件 (メイン venv では OpenFF 依存 2 件 skip、OpenFF 環境では全件 OK) |
 
 skip される 2 件は REFMAC5 が PATH に無いためで、CCP4 未導入環境では期待通りの挙動。
+
+## AMBER + OpenFF 併用 SPA リファイン実行例 (7db6, リガンド付き)
+
+メラトニン受容体 MT1–Gi1 + ラメルテオン (JEV) の 3.3 Å データ (EMD-30627) で、リガンドを OpenFF で
+パラメータ化しつつ AMBER prior を使う例。スクリプト化してある:
+
+```bash
+cd "$PROJECT_ROOT"
+bash docs/dev/examples/run_7db6_amber_openff.sh [出力先 (既定 work/7db6_amber_openff)] [サイクル数 (既定 5)]
+```
+
+スクリプトの内容:
+
+1. 半マップ 2 つと mmCIF を wwPDB から取得し MD5 を検証 (`tests/7db6/` にキャッシュ、テストと同じファイル)。
+2. OpenMM に CPU プラットフォームがあればそれを使う。
+3. `refine_spa_norefmac --amber_enable --amber_weight 0.1 --amber_his_state HIE --amber_ligand_ff openff-2.2.1 --amber_ligand_charge nagl --hout`
+4. 同じ条件で AMBER なしの参照リファインも実行。
+5. AMBER 項の推移、FSC、結合 rmsZ、リガンド周辺の接触残基数を要約表示。
+
+この環境での結果 (5 サイクル、AMBER あり/なし合計 2 分 23 秒):
+
+| 指標 | AMBER + OpenFF | AMBER なし |
+|---|---|---|
+| E_AMBER (kJ/mol) 各サイクル後 | −58,230 → −56,402 → −54,458 → −52,443 → −50,474 | – |
+| FSCaverage(full) | 0.809 | 0.829 |
+| 結合 rmsZ (非 H) サイクル 1→5 | 0.51 → 0.66 | 0.76 → 0.81 (2 サイクル目に 1.31) |
+| JEV から 4 Å 以内の残基数 | 19 | 22 |
+
+読み方:
+
+- リガンド JEV (40 原子、中性) は monomer library の化学情報から自動でパラメータ化される (ログの
+  `AMBER prior: JEV parameterised with openff-2.2.1`)。His 10 残基は HIE、ジスルフィド 4 本は CYX。
+- E_AMBER は 1 サイクル目で大きく下がった後、毎サイクル約 2,000 kJ/mol ずつ戻る。総目的関数は毎サイクル減少しており
+  受理されているが、実験項 (自動重み 1.10) に押されて力場的には少し悪い方向へ動いている。
+  `--amber_weight` を 0.2〜0.5 に上げると抑えられるはずで、重みの根拠付け (`--amber_weight_auto`) が次の課題。
+- AMBER ありでは FSC が 0.02 低く、結合 rmsZ は小さい。力場が幾何を引き締める分だけマップへの追従が弱まる、
+  期待どおりのトレードオフ。リガンド周辺の接触残基数の差は、ポケット側鎖の動きの違いを反映している。
+
+## `--amber_weight` の走査 (7db6)
+
+重みの探索もスクリプト化してある。AMBER なし (w=0) を含めて各重みで 5 サイクル実行し、FSC・E_AMBER・幾何指標を表にする。
+
+```bash
+cd "$PROJECT_ROOT"
+# 全マップに対する FSC
+bash docs/dev/examples/scan_amber_weight_7db6.sh work/7db6_weight_scan 5 3 0.02 0.05 0.1 0.2 0.5 1.0 2.0
+# half1 で精密化し half2 で評価 (過学習の確認)
+EXTRA_ARGS="--cross_validation" bash docs/dev/examples/scan_amber_weight_7db6.sh work/7db6_weight_scan_cv 5 3 0.1 0.2 0.3 0.5 1.0
+```
+
+この環境での結果 (5 サイクル、CPU プラットフォーム、3 並列で各スキャン約 3 分):
+
+| w_ff | FSC(full) | E_AMBER 1 サイクル後 | E_AMBER 5 サイクル後 | 結合 rmsZ | 結合角 rmsZ | VDW rmsZ |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 (AMBER なし) | 0.829 | – | – | 0.813 | 1.002 | 1.383 |
+| 0.02 | 0.826 | −49,079 | **+40,372** | 0.759 | 1.043 | 1.386 |
+| 0.05 | 0.818 | −55,493 | −40,588 | 0.703 | 0.993 | 1.337 |
+| 0.1 (既定) | 0.809 | −58,230 | −50,473 | 0.659 | 0.928 | 1.293 |
+| 0.2 | 0.798 | −60,332 | −57,913 | 0.609 | 0.866 | 1.256 |
+| 0.5 | 0.783 | −62,770 | −64,640 | 0.549 | 0.816 | 1.231 |
+| 1.0 | 0.774 | −64,145 | −68,480 | 0.541 | 0.820 | 1.224 |
+| 2.0 | 0.767 | −64,337 | −70,527 | 0.587 | 0.865 | 1.222 |
+
+クロスバリデーション (half1 で精密化):
+
+| w_ff | FSC(half1, work) | FSC(half2, free) | work − free |
+|---:|---:|---:|---:|
+| 0 | 0.791 | 0.727 | 0.064 |
+| 0.1 | 0.763 | 0.721 | 0.042 |
+| 0.2 | 0.750 | 0.715 | 0.035 |
+| 0.3 | 0.744 | 0.712 | 0.032 |
+| 0.5 | 0.746 | 0.714 | 0.033 |
+| 1.0 | 0.728 | 0.703 | 0.024 |
+
+読み方:
+
+- w ≤ 0.1 では E_AMBER がサイクルごとに上昇し、0.02 では 5 サイクル後に正の値まで戻る。実験項に押し負けて
+  力場的に悪化していく領域。
+- w = 0.2〜0.3 が転換点。E_AMBER は横ばい〜微減で、free FSC の低下は 0.012〜0.016、結合・VDW の rmsZ は
+  AMBER なしより明確に良い。
+- w ≥ 0.5 では E_AMBER はさらに下がるが free FSC の低下が 0.02 を超え、幾何指標もそれ以上は改善しない。
+- work − free の差 (過学習の目安) は重みとともに縮む。AMBER 項は過学習を抑えるが、この系・分解能では
+  free FSC を上回るまでには至らない (0 が最大)。
+- 結論として、この系では **w_ff ≈ 0.2〜0.3** が E_AMBER の安定性と FSC の両立点。ただし重みは実験項の自動重み
+  (ここでは 1.10) と原子数に依存するので、系ごとに走査するか、勾配ノルム比に基づく自動決定を実装するのが望ましい。
+
+結果ファイルは `work/7db6_weight_scan/w*/` と `work/7db6_weight_scan_cv/w*/` (各 `refined.log`, `refined_stats.json`,
+`refined.mmcif`, マップ)。
+
+## `--amber_weight_auto` (勾配ノルム比による自動重み)
+
+走査の結果を一般化したもの。1 サイクル目の勾配から
+
+$$
+w_{ff} = R \, \frac{\lVert g_{geom} \rVert}{\lVert g_{ff} \rVert}
+$$
+
+を決めて以降固定する ($g$ は xyz パラメータ上の勾配ベクトル、$R$ は `--amber_weight_auto R`、値省略時 0.3)。
+幾何拘束項を基準にしているので、力場項は「拘束と同程度の強さの追加拘束」として振る舞い、
+データが強い高分解能ではデータ項が自然に支配する。決定した重みと各項の勾配ノルムはログに出る:
+
+```
+ gradient norms over xyz: |g_geom|= 1.0286e+04 |w g_exp|= 4.8798e+03 |g_ff|= 1.1929e+04
+ ff_weight determined automatically: 0.2587 (|w_ff g_ff|/|g_geom| = 0.3)
+```
+
+stats JSON (`*_stats.json`) には各サイクルの `ff` (E_AMBER) と `ff_weight` が入る。
+
+実行例:
+
+```bash
+cd "$PROJECT_ROOT"
+CLIBD_MON="$PWD/third_party/monomers" PATH="$PWD/.venv-openff/bin:$PATH" \
+    .venv-openff/bin/python -m servalcat refine_spa_norefmac \
+    --model tests/7db6/7db6.cif.gz \
+    --halfmaps tests/7db6/emd_30627_half_map_1.map.gz tests/7db6/emd_30627_half_map_2.map.gz \
+    -d 3.3 --ncycle 5 --amber_enable --amber_weight_auto --amber_his_state HIE --amber_platform CPU \
+    --hout -o refined_auto
+```
+
+この環境での結果 (R = 0.3、5 サイクル):
+
+| 系 | 決定された w_ff | E_AMBER 1→5 サイクル後 (kJ/mol) | FSC(full) | free FSC (half2) |
+|---|---:|---|---:|---:|
+| 7db6 (MT1 + ラメルテオン) | 0.259 | −61,048 → −60,161 (ほぼ横ばい) | 0.793 | 0.713 (w=0 では 0.727) |
+| 7dy0 (streptavidin, apo) | 0.471 | −8,120 → −8,448 (単調減少) | 0.948 | – |
+
+読み方:
+
+- 7db6 では走査で見つけた最適域 (0.2〜0.3) に自動で入る。R = 0.3 はこの系で校正した値なので、他系での妥当性は
+  今後の確認事項。R = 1.0 だと w_ff = 0.86 となり、走査では FSC の低下が大きい領域に入る。
+- 7dy0 では手動の 0.05 より大きい 0.47 が選ばれた。7dy0 は力場勾配が幾何勾配に対して相対的に小さい
+  (|g_ff|/|g_geom| = 0.64、7db6 では 1.16) ため。FSC は 0.05 のときの 0.952 から 0.948 へ僅かに下がり、
+  E_AMBER は安定して減少する。
+- 重みは 1 サイクル目で固定する。サイクルごとに更新すると目的関数がサイクル間で変わり、
+  収束判定 (`fval_decreased`) の意味が曖昧になるため。
+
+結果ファイル: `work/7db6_weight_auto/{full,cv}/`, `work/7dy0_weight_auto/`。
+
+図とまとめ: `docs/dev/amber_weight_study_note_ja.md`。図の再生成は
+
+```bash
+cd "$PROJECT_ROOT"
+.venv-openff/bin/python docs/dev/examples/plot_amber_weight_study.py work docs/dev/figures
+```
+
+(matplotlib は OpenFF 環境に入っている。メイン venv で使う場合は `uv pip install matplotlib`)。
 
 ## AMBER 併用 SPA リファイン実行例 (7dy0, 1 cycle)
 
@@ -269,6 +467,8 @@ CLIBD_MON="$PWD/third_party/monomers" \
 - His のプロトン化状態は `--amber_his_state HIE` などで指定できる (既定 HIP = monomer library どおり)。
 - `--amber_enable` は `--hydrogen all` (既定) が必須。`--hydrogen no/yes`、`--unrestrained`、`--jellyonly` との併用は起動時にエラーになる。
 - `--amber_nonbonded` は `NoCutoff` か `CutoffNonPeriodic` のみ (PME は SPA のマップ箱を周期セルとみなしてしまうため除外)。
+- リガンドは monomer library の化学情報から OpenFF (既定 `openff-2.2.1`) で自動的にパラメータ化される。
+  OpenFF 環境 (上記) が無い場合は `--amber_ligand_ff none` にするか、リガンドの無いモデルを使う。
 - 対角 Hessian は既定で結合項から原子ごとに推定する (`--amber_hessian_mode bonded`)。旧挙動は
   `--amber_hessian_mode const --amber_hessian_diag 10`。背景は `amber_hessian_protonation_note_ja.md`。
 - 複数サイクルの安定性確認は `--ncycle 5 --hout` を付け、出力モデルの水 O–H 距離を見るのが手早い。

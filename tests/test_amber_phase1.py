@@ -2,12 +2,14 @@ from __future__ import absolute_import, division, print_function, generators
 import unittest
 import numpy
 import os
+import sys
 
 from servalcat.refine import refine_spa
 from servalcat.refine.ff_amber import xyz_grad_to_param_grad, AmberFFPrior
 from servalcat.refine.refine import RefineParams
 from servalcat import utils
 from servalcat import ext
+import gemmi
 
 
 class TestAmberPhase1(unittest.TestCase):
@@ -34,6 +36,11 @@ class TestAmberPhase1(unittest.TestCase):
         self.assertEqual(args.amber_nonbonded, "NoCutoff")
         self.assertEqual(args.amber_platform, "Reference")
         self.assertEqual(args.amber_hessian_diag, 1000.0)
+        self.assertIsNone(args.amber_weight_auto)
+        self.assertEqual(refine_spa.parse_args(["--halfmaps", "a", "b", "--model", "m.pdb", "-d", "3.0",
+                                                "--amber_weight_auto"]).amber_weight_auto, 0.3)
+        self.assertEqual(refine_spa.parse_args(["--halfmaps", "a", "b", "--model", "m.pdb", "-d", "3.0",
+                                                "--amber_weight_auto", "0.5"]).amber_weight_auto, 0.5)
         self.assertEqual(args.amber_hessian_mode, "bonded")
         self.assertEqual(args.amber_his_state, "HIP")
         self.assertEqual(args.amber_forcefield, ["amber14-all.xml", "amber14/tip3p.xml"])
@@ -134,6 +141,44 @@ class TestAmberPhase1(unittest.TestCase):
         hc = prior_c.hessian_diag_vector()
         self.assertEqual(set(numpy.unique(hc[hc > 0]).tolist()), {10.0})
 
+    def test_determine_ff_weight(self):
+        # geometry-only Refine object with a fake force-field prior: the weight must scale the
+        # ff gradient norm to RATIO x geometry gradient norm over xyz parameters (no OpenMM needed)
+        if "CLIBD_MON" not in os.environ:
+            self.skipTest("CLIBD_MON is not set")
+        from servalcat.refine.refine import Refine, Geom, load_config
+        st = utils.fileio.read_structure("tests/biotin/biotin_talos.pdb")
+        monlib = utils.restraints.load_monomer_library(st)
+        topo, _ = utils.restraints.prepare_topology(st, monlib, h_change=gemmi.HydrogenChange.NoChange)
+        self._renumber_serials(st)
+        from servalcat.refmac import refmac_keywords
+        params = refmac_keywords.parse_keywords([])
+        cfg = load_config(None, None, params)
+        rp = RefineParams(st, refine_xyz=True, adp_mode=0, refine_occ=False, refine_dfrac=False, cfg=cfg)
+        geom = Geom(st, topo, monlib, rp, cfg, shake_rms=0.3, params=params)
+        geom.setup_nonbonded()
+        geom.setup_target()
+
+        class FakePrior:
+            hessian_diag = 1000.; hessian_mode = "const"; his_state = "HIP"
+            def __init__(self, n): self.n = n
+            def calc_target_and_grad(self, target_only=False):
+                g = numpy.arange(1, self.n + 1, dtype=float)
+                return 5.0, (None if target_only else g)
+            def hessian_diag_vector(self): return numpy.full(self.n, 1000.)
+        prior = FakePrior(rp.n_params())
+        ref = Refine(st, geom, cfg, rp, ll=None, ff_prior=prior, ff_weight=0.1, ff_weight_auto=0.5)
+        self.assertFalse(ref.ff_weight_determined)
+        ref.calc_target(1)
+        self.assertTrue(ref.ff_weight_determined)
+        sel = rp.vec_selection(ext.RefineParams.Type.X)
+        g_geom = numpy.linalg.norm(numpy.array(geom.geom.target.vn)[sel])
+        g_ff = numpy.linalg.norm(prior.calc_target_and_grad()[1][sel])
+        self.assertAlmostEqual(ref.ff_weight * g_ff / g_geom, 0.5, places=6)
+        w1 = ref.ff_weight
+        ref.calc_target(1)  # determined once only
+        self.assertEqual(ref.ff_weight, w1)
+
     def test_bonded_hessian_diag_matches_finite_difference(self):
         # water-like 3-atom system at equilibrium: Gauss-Newton diagonal equals the exact Hessian diagonal
         from servalcat.refine.ff_amber import bonded_hessian_diag
@@ -202,13 +247,177 @@ class TestAmberPhase1(unittest.TestCase):
         st = utils.fileio.read_structure("tests/biotin/biotin_talos.pdb")
         self._renumber_serials(st)
         rp = RefineParams(st, refine_xyz=True, adp_mode=0, refine_occ=False, refine_dfrac=False, cfg=None)
+        # ligand parameterisation disabled: OpenMM template error
         with self.assertRaises(RuntimeError) as cm:
             AmberFFPrior(st, rp,
                          forcefield_files=["amber14-all.xml", "amber14/tip3p.xml"],
                          nonbonded_method="NoCutoff",
                          platform_name="Reference",
-                         hessian_diag=10.0)
+                         hessian_diag=10.0, ligand_ff="none")
         self.assertIn("OpenMM failed to build an AMBER system", str(cm.exception))
+        # ligand parameterisation enabled but no monomer library given
+        with self.assertRaises(RuntimeError) as cm:
+            AmberFFPrior(st, rp, platform_name="Reference")
+        self.assertIn("no monomer library", str(cm.exception))
+
+    def test_parse_args_ligand_options(self):
+        args = refine_spa.parse_args(["--halfmaps", "a", "b", "--model", "m.pdb", "-d", "3.0"])
+        self.assertEqual(args.amber_ligand_ff, "openff-2.2.1")
+        self.assertEqual(args.amber_ligand_charge, "nagl")
+        self.assertEqual(args.amber_ligand_smiles, [])
+        from servalcat.refine import ff_ligand
+        self.assertEqual(ff_ligand.parse_smiles_overrides(["BTN=C(=O)[O-]", "X=CC"]), {"BTN": "C(=O)[O-]", "X": "CC"})
+        with self.assertRaises(RuntimeError):
+            ff_ligand.parse_smiles_overrides(["BTN"])
+
+    def test_chemcomp_to_rdkit(self):
+        try:
+            from rdkit import Chem
+        except ImportError:
+            self.skipTest("rdkit is not installed")
+        if "CLIBD_MON" not in os.environ:
+            self.skipTest("CLIBD_MON is not set")
+        from servalcat.refine import ff_ligand
+        import gemmi
+        ml = gemmi.read_monomer_lib(os.environ["CLIBD_MON"], ["BTN", "TRP", "SO4", "SPK"])
+        for name, expected_charge in (("BTN", -1), ("SO4", -2), ("SPK", 4)):
+            mol, names = ff_ligand.chemcomp_to_rdkit(ml.monomers[name])
+            self.assertEqual(mol.GetNumAtoms(), len(ml.monomers[name].atoms))
+            self.assertEqual(Chem.GetFormalCharge(mol), expected_charge)
+            self.assertEqual(len(names), mol.GetNumAtoms())
+        # aromatic ring (Kekule form in the dictionary) is perceived as aromatic by RDKit
+        mol, names = ff_ligand.chemcomp_to_rdkit(ml.monomers["TRP"])
+        self.assertTrue(any(a.GetIsAromatic() for a in mol.GetAtoms()))
+        # subset of atoms (e.g. without OXT/H2/H3 as in a polymer)
+        sub = [n for n in names if n not in ("OXT", "H2", "H3")]
+        mol2, names2 = ff_ligand.chemcomp_to_rdkit(ml.monomers["TRP"], sub)
+        self.assertEqual(mol2.GetNumAtoms(), len(sub))
+
+    def test_ligand_openff_prior_optional(self):
+        try:
+            import openmm  # noqa: F401
+            import openmmforcefields  # noqa: F401
+            from openff.toolkit import Molecule  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenMM/openmmforcefields/openff-toolkit are not installed")
+        if "CLIBD_MON" not in os.environ:
+            self.skipTest("CLIBD_MON is not set")
+        st = utils.fileio.read_structure("tests/biotin/biotin_talos.pdb")
+        monlib = utils.restraints.load_monomer_library(st)
+        utils.restraints.add_hydrogens(st, monlib, "nucl")
+        self._renumber_serials(st)
+        rp = RefineParams(st, refine_xyz=True, adp_mode=0, refine_occ=False, refine_dfrac=False, cfg=None)
+        # without ligand parameterisation biotin has no template
+        with self.assertRaises(RuntimeError):
+            AmberFFPrior(st, rp, platform_name="Reference", monlib=monlib, ligand_ff="none")
+        # gasteiger charges keep the test fast and free of AmberTools
+        prior = AmberFFPrior(st, rp, platform_name="Reference", monlib=monlib,
+                             ligand_ff="openff-2.2.1", ligand_charge="gasteiger")
+        self.assertEqual(len(prior.ligand_info), 1)
+        self.assertEqual(prior.ligand_info[0][0], "BTN")
+        self.assertEqual(prior.ligand_info[0][2], -1)
+        ene, grad = prior.calc_target_and_grad()
+        self.assertTrue(numpy.isfinite(ene))
+        self.assertEqual(len(grad), rp.n_params())
+        self.assertTrue(numpy.all(numpy.isfinite(grad)))
+        hd = prior.hessian_diag_vector()
+        self.assertTrue(numpy.all(hd[hd > 0] >= prior.hessian_diag))
+        # gradient check on one atom
+        cra = next(c for c in st[0].all() if c.atom.element.name == "C")
+        pidx = list(rp.atom_to_param(ext.RefineParams.Type.X))[cra.atom.serial - 1]
+        x0 = numpy.array(cra.atom.pos.tolist()); h = 1e-4; num = []
+        for ax in range(3):
+            es = []
+            for sgn in (+1, -1):
+                v = x0.copy(); v[ax] += sgn * h; cra.atom.pos = gemmi.Position(*v)
+                es.append(prior.calc_target_and_grad(target_only=True)[0])
+            num.append((es[0] - es[1]) / (2 * h))
+        cra.atom.pos = gemmi.Position(*x0)
+        numpy.testing.assert_allclose(num, grad[pidx*3:pidx*3+3], rtol=1e-3, atol=1e-2)
+
+
+class TestAmberLigandRealData(unittest.TestCase):
+    """7db6 (melatonin receptor MT1-Gi1 with ramelteon, EMD-30627, 3.3 A): AMBER prior with an
+    OpenFF-parameterised ligand on real cryo-EM half maps. Needs the OpenFF environment and network
+    access for the first run (files are cached in tests/7db6, verified by MD5)."""
+    root = os.path.abspath(os.path.dirname(__file__))
+    url_md5 = (("half1", "https://files.wwpdb.org/pub/emdb/structures/EMD-30627/other/emd_30627_half_map_1.map.gz",
+                "319dc338b6a44f9be02f5c4b2c07c1b4"),
+               ("half2", "https://files.wwpdb.org/pub/emdb/structures/EMD-30627/other/emd_30627_half_map_2.map.gz",
+                "322e28cb5fd70bc893c01c02fbec6a2b"),
+               ("mmcif", "https://files.wwpdb.org/pub/pdb/data/structures/divided/mmCIF/db/7db6.cif.gz",
+                "86fce1c3112c758ff4acc6c0f4bc0e54"))
+
+    @classmethod
+    def download(cls):
+        import hashlib
+        from urllib.request import urlretrieve
+        wd = os.path.join(cls.root, "7db6")
+        os.makedirs(wd, exist_ok=True)
+        data = {}
+        for name, url, md5 in cls.url_md5:
+            dst = os.path.join(wd, os.path.basename(url))
+            if not os.path.exists(dst):
+                print("downloading {}".format(url))
+                urlretrieve(url, dst)
+            with open(dst, "rb") as f:
+                md5f = hashlib.md5(f.read()).hexdigest()
+            if md5 != md5f:
+                raise RuntimeError("md5 mismatch for {}: {} != {}".format(dst, md5f, md5))
+            data[name] = dst
+        return data
+
+    def test_refine_spa_amber_openff_7db6(self):
+        try:
+            import openmm  # noqa: F401
+            import openmmforcefields  # noqa: F401
+            from openff.toolkit import Molecule  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenMM/openmmforcefields/openff-toolkit are not installed")
+        if "CLIBD_MON" not in os.environ:
+            self.skipTest("CLIBD_MON is not set")
+        import json
+        import tempfile
+        from servalcat.__main__ import main
+        data = self.download()
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory(prefix="servalcat_7db6_") as d:
+            os.chdir(d)
+            try:
+                sys.argv = ["", "refine_spa_norefmac",
+                            "--model", data["mmcif"], "--halfmaps", data["half1"], data["half2"],
+                            "-d", "3.3", "--ncycle", "2",
+                            "--amber_enable", "--amber_his_state", "HIE", "--amber_platform", "Reference",
+                            "--hout", "-o", "refined"]
+                main()
+                self.assertTrue(os.path.isfile("refined.mmcif"))
+                self.assertTrue(os.path.isfile("refined_stats.json"))
+                with open("refined.log") as ifs:
+                    log = ifs.read()
+                self.assertIn("JEV parameterised with openff-2.2.1", log)
+                self.assertIn("disulfide bond(s) -> CYX", log)
+                ff = [float(l.split("=")[1]) for l in log.splitlines() if l.startswith(" ff= ")]
+                self.assertGreaterEqual(len(ff), 3)
+                self.assertTrue(all(numpy.isfinite(ff)))
+                self.assertLess(ff[-1], ff[0])  # AMBER energy must not blow up over the cycles
+                stats = json.load(open("refined_stats.json"))
+                self.assertEqual(len(stats), 3)  # cycle 0 + 2 cycles
+                self.assertTrue(all(s_["fval_decreased"] for s_ in stats[1:]))
+                fsc = [float(l.split("=")[1]) for l in log.splitlines() if l.strip().startswith("FSCaverage(full)")]
+                self.assertGreater(fsc[-1], 0.6)
+                # ligand kept its geometry: JEV heavy atoms and hydrogens still bonded (no atom flew away)
+                st = utils.fileio.read_structure("refined.mmcif")
+                jev = [r for ch in st[0] for r in ch if r.name == "JEV"]
+                self.assertEqual(len(jev), 1)
+                self.assertEqual(len(jev[0]), 40)
+                ns = gemmi.NeighborSearch(st[0], st.cell, 3).populate()
+                for a in jev[0]:
+                    dmin = min((m.pos.dist(a.pos) for m in (mk.to_cra(st[0]).atom for mk in ns.find_atoms(a.pos, '\0', radius=2.0))
+                                if m is not a), default=9.)
+                    self.assertLess(dmin, 1.9)
+            finally:
+                sys.argv = [""]
+                os.chdir(cwd)
 
 
 if __name__ == "__main__":

@@ -51,6 +51,8 @@ $$
 - `--amber_enable`
 - `--amber_weight` (既定 0.1。$E_{AMBER}$ は kJ/mol、$L_{geom}$ は無次元なので次元の異なる量を混ぜる係数。
   7dy0 では 0.05 で幾何項と同程度の勾配になる。根拠付けは `--amber_weight_auto` の課題)
+- `--amber_weight_auto [R]` (1 サイクル目の勾配ノルム比 |w_ff g_ff| / |g_geom| = R で重みを自動決定、R 省略時 0.3。
+  `--amber_weight` より優先。決定値と各項の勾配ノルムをログと stats JSON に出す)
 - `--amber_forcefield` (既定 `amber14-all.xml amber14/tip3p.xml`)
 - `--amber_nonbonded` (`NoCutoff` | `CutoffNonPeriodic`, 既定 `NoCutoff`。PME など周期法は非対応:
   SPA では `st.cell` にマップの箱が入り、一時 PDB の CRYST1 経由で周期セルとして渡ってしまうため。
@@ -61,7 +63,7 @@ $$
 - `--amber_hessian_mode` (`bonded` | `const`, 既定 `bonded`)
 - `--amber_his_state` (`HIP` | `HIE` | `HID`, 既定 `HIP`)
 
-詳細な導出と検証は `amber_hessian_protonation_note_ja.md` を参照。
+詳細な導出と検証は `amber_hessian_protonation_note_ja.md`、重みと Hessian の検討 (図付き) は `amber_weight_study_note_ja.md` を参照。
 
 ## 数値的取り扱い
 
@@ -128,8 +130,7 @@ $$
   水素の位置は幾何拘束と AMBER 項で決まる。
 
 12. ステップ受理
-- 受理判定は総目的関数 $f$ のみで、$E_{AMBER}$ が増えても受理される。ログの `ff=` を監視する。
-  stats JSON には現状 AMBER 項が入らない (次フェーズ候補)。
+- 受理判定は総目的関数 $f$ のみで、$E_{AMBER}$ が増えても受理される。ログの `ff=` と stats JSON の `ff` を監視する。
 
 ## テスト
 
@@ -209,6 +210,80 @@ CLIBD_MON="$PWD/third_party/monomers" \
 結果の詳細と修正前後の比較は `amber_hessian_protonation_note_ja.md` の 5 節を参照。
 `refine_spa_norefmac` はカレントディレクトリに `input_model_expanded.*` も書き出す (upstream 由来) ので注意。
 
+## Phase 2: リガンドへの力場割り当て (OpenFF / GAFF)
+
+AMBER の XML (amber14) はタンパク質・核酸・水・一部イオンしか覆わないため、それ以外の残基
+(低分子リガンド、非標準残基) は openmmforcefields のテンプレート生成器で扱う。
+詳細は `amber_hessian_protonation_note_ja.md` の 7 節。
+
+### 実装ファイル
+
+1. `servalcat/refine/ff_ligand.py`
+   - `find_ligand_residues()`: 標準残基名でなく、かつ ForceField に同名テンプレートが無い残基を抽出
+     (`ForceField.getUnmatchedResidues()` は外部結合を無視できず OXT 欠損の C 末端を拾うので使わない)
+   - `chemcomp_to_rdkit()`: gemmi `ChemComp` (monomer library) → RDKit Mol。結合次数と形式電荷は辞書から。
+     Kekulé 形式の aromatic 結合はそのまま渡し RDKit に芳香族性を認識させる。Deloc/Unspec 結合を含む
+     辞書は、連結性と総電荷から `rdDetermineBonds` で結合次数を再導出する
+   - `chemcomp_to_openff_molecule()`: RDKit Mol → OpenFF `Molecule` (辞書座標があれば立体を 3D から割り当て)。
+     `--amber_ligand_smiles NAME=SMILES` で化学を上書きできる
+   - `add_residue_bonds()`: `PDBFile` が知らない非標準残基の残基内結合を辞書からトポロジへ追加
+   - `assign_ligand_charges()`: `nagl` (既定) / `am1bcc` / `gasteiger`
+   - `register_ligand_templates()`: 上記をまとめ、`SMIRNOFFTemplateGenerator` (OpenFF) または
+     `GAFFTemplateGenerator` (gaff-*) を ForceField に登録
+
+2. `servalcat/refine/ff_amber.py`
+   - `AmberFFPrior(monlib=..., ligand_ff=..., ligand_charge=..., ligand_smiles=...)`
+   - `createSystem()` の前にリガンド残基があれば `register_ligand_templates()` を呼ぶ。`ligand_info` に記録
+
+3. `servalcat/refine/refine_spa.py`
+   - `--amber_ligand_ff` (既定 `openff-2.2.1`、`gaff-2.11` など、`none` で無効)
+   - `--amber_ligand_charge` (`nagl` | `am1bcc` | `gasteiger`)
+   - `--amber_ligand_smiles NAME=SMILES ...`
+
+### 処理の流れ
+
+1. Servalcat が monomer library で水素を全生成 (`ReAdd`) → リガンドの水素集合は辞書どおり。
+2. 一時 PDB → `PDBFile`。標準残基の結合は `PDBFile` が作る。リガンドの結合は辞書から追加。
+3. リガンド残基名ごとに辞書 → RDKit → OpenFF `Molecule` を作り、部分電荷を割り当てる。
+4. テンプレート生成器を登録。OpenMM は残基グラフ (元素+連結性) と `Molecule` の同型で照合し、
+   結合次数・形式電荷・部分電荷は `Molecule` 側のものを使う。
+5. 以降は Phase 1 と同じ (エネルギー・勾配・対角 Hessian)。結合項の対角推定はリガンドの結合にもそのまま効く。
+
+### 制約
+
+- 他残基と共有結合したリガンド・修飾残基 (糖鎖、共有結合阻害剤、6mw0 の MLE/DPN のようなペプチド内の非標準残基)
+  は非対応。明示的なエラーで止まる。
+- モデル中のリガンド原子集合は辞書と一致している必要がある (部分的にしか置かれていないリガンドは同型照合に失敗する)。
+- 系が大きいと Reference プラットフォームでは遅い (7db6: 水素込み約 17,000 原子で 1 サイクル約 25 秒)。`--amber_platform CPU` を推奨。
+- 重水 (DOD) など元素 D を含む残基は未検証。
+- 金属配位結合 (辞書の Metal 型) は無視される。金属イオン自体は amber14 に同名テンプレートがあれば
+  そちらで扱われ、無ければエラー。
+- GAFF と AM1-BCC は AmberTools (`antechamber` / `sqm`) が PATH に必要。
+
+### 確認結果 (この開発環境, 2026-09-09)
+
+- `tests/biotin/biotin_talos.pdb` (BTN 単体, 31 原子, 形式電荷 −1): openff-2.2.1 + gasteiger で系構築、
+  勾配が数値微分と一致 (`test_ligand_openff_prior_optional`)。
+- 1stp (streptavidin + BTN): nagl と am1bcc の両方でパラメータ化。電荷和 −1.000、勾配が数値微分と一致、
+  BTN の対角 Hessian は重原子 5,189 / 水素 1,312 kJ/mol/Å² とタンパク質と同程度。
+  セットアップ時間は nagl 9.9 s、am1bcc 25.3 s (sqm)。
+- 1stp から合成した半マップで `refine_spa_norefmac --amber_enable --amber_his_state HIE` を 3 サイクル実行し完走。
+- 6mw0 (環状ペプチド、MLE/DPN が主鎖に結合): 「covalently linked」のエラーで停止することを確認。
+- 7db6 / EMD-30627 (メラトニン受容体 MT1–Gi1 + ラメルテオン JEV, 3.3 Å, 半マップあり): 実データでの
+  `refine_spa_norefmac --amber_enable --amber_his_state HIE` を 3 サイクル実行し完走 (Reference, 約 80 秒)。
+  JEV (40 原子, 中性) は openff-2.2.1 + nagl でパラメータ化。His 10 残基を HIE 化、ジスルフィド 4 本を CYX 化。
+  $E_{AMBER}$ は −52,382 → −58,231 → −56,403 → −54,459 kJ/mol (総目的関数は毎サイクル減少)、FSC(full) 0.797。
+  テスト `TestAmberLigandRealData.test_refine_spa_amber_openff_7db6` として組み込み (7dy0 と同じくダウンロード + MD5 検証、
+  `tests/7db6/` にキャッシュ、OpenFF 環境が無ければ skip)。
+  実行例スクリプト: `docs/dev/examples/run_7db6_amber_openff.sh` (AMBER なしとの比較付き。5 サイクルで FSC 0.809 vs 0.829、
+  結合 rmsZ 0.66 vs 0.81。E_AMBER はサイクルごとに約 2,000 kJ/mol 上昇し、重み調整の必要性を示す)。
+
+### ジスルフィド結合
+
+`ignoreExternalBonds=True` のもとでは、HG を持たない CYS が CYM (チオラート) と CYX (ジスルフィド) の両方に一致し、
+OpenMM が「Multiple non-identical matching templates」で失敗する (7db6 で発生)。`PDBFile` は SG–SG 距離 < 3 Å から
+ジスルフィド結合をトポロジに作るので、SG–SG 結合を持つ CYS を `createSystem(residueTemplates=...)` で CYX に固定する。
+
 ## 実装ステータス
 
 - [x] Phase 1 設計ドキュメント作成
@@ -225,15 +300,20 @@ CLIBD_MON="$PWD/third_party/monomers" \
 - [x] `ReAdd` 時の核位置調整
 - [x] His プロトン化状態オプション、C 末端 OXT 欠損の警告
 - [x] `--hydrogen all` 等の前提チェック (`check_amber_args()`)、PME の除外と周期境界の遮断
+- [x] リガンドへの OpenFF/GAFF 力場割り当て (Phase 2、monomer library の化学情報から)
+- [x] 実データ (7db6, 3.3 Å, ラメルテオン) での AMBER + OpenFF リファイン確認とテスト化
+- [x] ジスルフィド結合 CYS の CYX テンプレート固定
+- [x] 7db6 での `--amber_weight` 走査 (FSC / クロスバリデーション / E_AMBER / 幾何) と走査スクリプト
+- [x] `--amber_weight_auto` (勾配ノルム比) の実装、stats JSON への `ff` / `ff_weight` 出力、7db6・7dy0 での確認
 - [ ] His の残基ごとのプロトン化指定
+- [ ] 共有結合したリガンド・修飾残基への対応
 
 ## 次フェーズ候補
 
-1. 出力 stats JSON へ AMBER エネルギー履歴を書き出し (安定性評価に直結するので優先)
-2. `--amber_weight_auto` の導入（勾配ノルム比ベース）
+1. `--amber_weight_auto` の既定比 R = 0.3 を 7db6 以外の系でも検証する (分解能・系サイズ依存性)
 3. `--amber_platform` の既定を CPU (利用可能なら) にし、無ければ Reference にフォールバック
 4. implicit solvent (`implicit/obc2.xml` など) の検証
-5. リガンド向け追加パラメータ入力（XML）
+5. 共有結合リガンド・修飾残基 (openff の `Molecule` にキャップを付けて残基テンプレート化する方式を検討)
 6. His の残基ごとのプロトン化指定、モデル側への OXT 補完
 7. 対角 Hessian への二面角項の追加
 8. C++ ソルバ経路への統合最適化 (対角ベクトルを渡す口を作る)

@@ -16,6 +16,7 @@ from servalcat.spa import fofc
 from servalcat.refine import spa
 from servalcat.refine.refine import Geom, Refine, RefineParams, update_meta, print_h_options, load_config
 from servalcat.refine.ff_amber import AmberFFPrior
+from servalcat.refine import ff_ligand
 from servalcat.refmac import refmac_keywords
 b_to_u = utils.model.b_to_u
 
@@ -134,6 +135,11 @@ def add_arguments(parser):
                         help="Enable AMBER force-field prior (Phase 1: xyz only)")
     parser.add_argument("--amber_weight", type=float, default=0.1,
                         help="Weight for AMBER force-field prior (default: %(default)f)")
+    parser.add_argument("--amber_weight_auto", type=float, nargs="?", const=0.3, default=None, metavar="RATIO",
+                        help="Determine the AMBER weight automatically at the first cycle so that the force-field "
+                             "gradient norm over xyz parameters equals RATIO times the geometry restraint gradient norm "
+                             "(RATIO defaults to 0.3 when the flag is given without a value, calibrated on 7db6); "
+                             "overrides --amber_weight")
     parser.add_argument("--amber_forcefield", nargs="+",
                         default=["amber14-all.xml", "amber14/tip3p.xml"],
                         help="OpenMM forcefield XML files (default: %(default)s)")
@@ -149,6 +155,16 @@ def add_arguments(parser):
     parser.add_argument("--amber_hessian_mode", choices=["bonded", "const"], default="bonded",
                         help="How to approximate the AMBER Hessian diagonal: per-atom Gauss-Newton estimate from "
                              "bond/angle terms (bonded) or a constant (const) (default: %(default)s)")
+    parser.add_argument("--amber_ligand_ff", default="openff-2.2.1",
+                        help="Force field for residues without AMBER templates (ligands), assigned via openmmforcefields "
+                             "from the monomer library chemistry: an OpenFF/SMIRNOFF name (e.g. openff-2.2.1), a GAFF name "
+                             "(e.g. gaff-2.11, needs AmberTools) or none to disable (default: %(default)s)")
+    parser.add_argument("--amber_ligand_charge", choices=["nagl", "am1bcc", "gasteiger"], default="nagl",
+                        help="Partial charge method for ligands: nagl (openff-nagl GNN trained on AM1-BCC, fast), "
+                             "am1bcc (AmberTools sqm on PATH, slow), gasteiger (RDKit, crude) (default: %(default)s)")
+    parser.add_argument("--amber_ligand_smiles", nargs="+", default=[], metavar="NAME=SMILES",
+                        help="Override the chemistry of a ligand (bond orders/charges) with a SMILES; "
+                             "the hydrogen count must match the model")
     parser.add_argument("--amber_his_state", choices=["HIP", "HIE", "HID"], default="HIP",
                         help="Histidine protonation state in the force field. HIP keeps HD1 and HE2 as generated "
                              "from the monomer library; HIE/HID exclude HD1/HE2 from the force field (default: %(default)s)")
@@ -334,11 +350,16 @@ def main(args):
                                 platform_name=args.amber_platform,
                                 hessian_diag=args.amber_hessian_diag,
                                 hessian_mode=args.amber_hessian_mode,
-                                his_state=args.amber_his_state)
+                                his_state=args.amber_his_state,
+                                monlib=monlib,
+                                ligand_ff=args.amber_ligand_ff,
+                                ligand_charge=args.amber_ligand_charge,
+                                ligand_smiles=ff_ligand.parse_smiles_overrides(args.amber_ligand_smiles))
     refiner = Refine(st, geom, refine_cfg, refine_params, ll,
                      unrestrained=args.unrestrained,
                      ff_prior=ff_prior,
-                     ff_weight=args.amber_weight)
+                     ff_weight=args.amber_weight,
+                     ff_weight_auto=args.amber_weight_auto)
 
     geom.geom.adpr_max_dist = args.max_dist_for_adp_restraint
     if args.adp_restraint_power is not None: geom.geom.adpr_d_power = args.adp_restraint_power
