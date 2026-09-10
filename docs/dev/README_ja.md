@@ -31,6 +31,9 @@
 8. `examples/compare_amber_minimizers.py`
    - 最適化器 3 版 (GN+対角 / GN+非対角 / L-BFGS) の実行結果を表にまとめる。
 
+9. `examples/compare_minimizer_x_ff.py`
+   - 最適化器 × 力場の 2×2 (AMBER あり/なし、GN/L-BFGS) をクロスバリデーション込みで表にまとめる。
+
 ## この階層での運用方針
 
 - 開発向けの手順・注意事項は `docs/dev/` 配下へ集約する。

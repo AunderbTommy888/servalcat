@@ -179,7 +179,8 @@ def add_arguments(parser):
     parser.add_argument("--amber_minimizer", choices=["gn", "lbfgs"], default="gn",
                         help="Minimiser: gn = one Gauss-Newton step per cycle (default), "
                              "lbfgs = L-BFGS-B on the diagonally preconditioned target, which builds the missing "
-                             "curvature from the gradient history instead of from the Hessian")
+                             "curvature from the gradient history instead of from the Hessian. Usable without "
+                             "--amber_enable, on the classical target")
     parser.add_argument("--amber_lbfgs_maxiter", type=int, default=20,
                         help="Maximum L-BFGS-B iterations per cycle (default: %(default)d)")
     parser.add_argument("--amber_lm_damping", type=float, default=0., metavar="LAMBDA",
@@ -215,8 +216,13 @@ def resolve_amber_weight(args):
 def check_amber_args(args):
     """Fail early with a clear message when --amber_enable is combined with unsupported options."""
     if not getattr(args, "amber_enable", False):
-        if args.amber_minimizer != "gn" or args.amber_hessian_offdiag:
-            raise SystemExit("Error: --amber_minimizer / --amber_hessian_offdiag require --amber_enable")
+        # the minimiser and the damping are not AMBER-specific: L-BFGS on the classical target is the
+        # control experiment for "is the gain from the minimiser or from the force field?"
+        if args.amber_hessian_offdiag:
+            raise SystemExit("Error: --amber_hessian_offdiag requires --amber_enable "
+                             "(it is the force-field Hessian)")
+        if args.amber_lm_damping < 0 or args.amber_lbfgs_maxiter < 0:
+            raise SystemExit("Error: --amber_lm_damping and --amber_lbfgs_maxiter must not be negative")
         return
     if not 0. <= args.amber_replace_geom <= 1.:
         raise SystemExit("Error: --amber_replace_geom must be within [0, 1] (got {})".format(args.amber_replace_geom))

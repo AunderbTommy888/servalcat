@@ -138,10 +138,10 @@ class TestAmberPhase1(unittest.TestCase):
         with self.assertRaises(SystemExit):
             refine_spa.check_amber_args(refine_spa.parse_args(
                 base + ["--amber_hessian_offdiag", "--amber_hessian_mode", "const"]))
-        # minimiser / off-diagonal options require --amber_enable
-        for extra in (["--amber_minimizer", "lbfgs"], ["--amber_hessian_offdiag"]):
-            with self.assertRaises(SystemExit):
-                refine_spa.check_amber_args(refine_spa.parse_args(base[:-1] + extra))
+        # the off-diagonal Hessian needs the force field, but the minimiser does not
+        with self.assertRaises(SystemExit):
+            refine_spa.check_amber_args(refine_spa.parse_args(base[:-1] + ["--amber_hessian_offdiag"]))
+        refine_spa.check_amber_args(refine_spa.parse_args(base[:-1] + ["--amber_minimizer", "lbfgs"]))
 
     def test_xyz_grad_to_param_grad(self):
         grad_xyz = numpy.array([
